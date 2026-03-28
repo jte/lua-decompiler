@@ -1,0 +1,8 @@
+[package]
+name = "disassembler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+utils = { path = "../utils" }
+luac-parser = { git = "https://github.com/jte/luac-parser-rs" }

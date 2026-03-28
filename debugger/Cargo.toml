@@ -1,0 +1,12 @@
+[package]
+name = "debugger"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ldebug"
+path = "src/main.rs"
+
+[dependencies]
+disassembler = { path = "../disassembler" }
+luac-parser   = { git = "https://github.com/jte/luac-parser-rs" }
