@@ -1,4 +1,5 @@
 pub mod cfg;
+pub mod linearize;
 
 use std::collections::HashSet;
 
@@ -21,6 +22,20 @@ use crate::cfg::{Cfg, EdgeKind};
 /// Decompile a top-level `Proto` into a Lua source string.
 pub fn decompile(proto: &Proto) -> String {
     let mut ctx = DecompileCtx::new(proto, 0);
+    ctx.run();
+    ctx.finish()
+}
+
+/// Decompile a `Proto` that may use JMP-spaghetti control-flow flattening.
+///
+/// If the proto (or any of its sub-protos) exhibits the spaghetti pattern,
+/// a linearization pass is applied first to remove relay JMPs and lay the
+/// real instructions out in execution order before handing off to the
+/// standard decompiler.
+pub fn decompile_cff(proto: &Proto) -> String {
+    // linearize_tree handles spaghetti detection recursively at every depth.
+    let linearized = linearize::linearize_tree(proto);
+    let mut ctx = DecompileCtx::new(&linearized, 0);
     ctx.run();
     ctx.finish()
 }
@@ -220,27 +235,45 @@ impl<'p> DecompileCtx<'p> {
         pre_loop_regs: &[String],
         exclude: &[usize],
     ) -> HashSet<usize> {
-        let mut carried: HashSet<usize> = HashSet::new();
-        let mut worklist = vec![body_start];
+        // Collect all reachable body nodes (stopping at stop_node / back-edges).
+        let mut body_nodes: Vec<NodeIndex> = Vec::new();
         let mut seen: HashSet<NodeIndex> = HashSet::new();
+        let mut worklist = vec![body_start];
         while let Some(node) = worklist.pop() {
             if node == stop_node || seen.contains(&node) {
                 continue;
             }
             seen.insert(node);
+            body_nodes.push(node);
+            for succ in cfg.graph.neighbors(node) {
+                worklist.push(succ);
+            }
+        }
+
+        // Sort by block start-PC to get a topological / execution-order traversal.
+        // After CFF linearization the CFG is a linear chain so PC order == topo order.
+        // For code with genuine branches this is an approximation, but it's
+        // conservative in the right direction: a register written in any block
+        // whose start-PC precedes the read block is treated as already-written,
+        // preventing over-eager loop-carried marking.
+        body_nodes.sort_by_key(|&n| cfg.graph[n].start);
+
+        let mut carried: HashSet<usize> = HashSet::new();
+        // Use a GLOBAL written set that accumulates across all body blocks processed
+        // in PC order.  This correctly handles writes in block A being visible when
+        // block B (a later block that reads the same register) is processed.
+        let mut written: HashSet<usize> = HashSet::new();
+
+        for node in body_nodes {
             let bb = &cfg.graph[node];
-            // Per-block write tracking: once a register is written inside this
-            // block's instruction sequence it is no longer a "pre-loop value".
-            let mut written: HashSet<usize> = HashSet::new();
             for pc in bb.start..=bb.end {
                 let instr = self.proto.code[pc];
                 let op = get_opcode(instr);
                 let a  = getarg_a(instr) as usize;
                 let b  = getarg_b(instr) as usize;
                 let c  = getarg_c(instr) as usize;
-                // Always record any write to register A — even non-expr ops like
-                // NEWTABLE, CALL, CLOSURE, VARARG write a fresh value to A, so
-                // the register is no longer carrying its pre-loop expression.
+                // Record writes first (so a self-referential op like A = A + B
+                // does not mark A as loop-carried).
                 if writes_to_a(op) {
                     written.insert(a);
                 }
@@ -248,7 +281,7 @@ impl<'p> DecompileCtx<'p> {
                     continue;
                 }
                 // Check whether any SOURCE register carries a pre-loop value that
-                // has not yet been overwritten in this block.
+                // has not yet been overwritten anywhere earlier in the body.
                 for src in instr_source_regs(op, b, c) {
                     if !exclude.contains(&src)
                         && !self.loop_carried_regs.contains(&src)
@@ -259,9 +292,6 @@ impl<'p> DecompileCtx<'p> {
                         carried.insert(src);
                     }
                 }
-            }
-            for succ in cfg.graph.neighbors(node) {
-                worklist.push(succ);
             }
         }
         carried
@@ -442,7 +472,21 @@ impl<'p> DecompileCtx<'p> {
                 let is_conditional = bb.end > bb.start
                     && is_skip_instr(get_opcode(self.proto.code[bb.end - 1]));
 
-                if is_conditional {
+                // Special case: TFORCALL (LuaDecTForLoop) + JMP → TFORLOOP.
+                // In linearized CFF code the TFORCALL may sit in its own block
+                // (separated from TFORLOOP by the linearizer).  It is a skip
+                // instruction, so `is_conditional` fires — but this is NOT an
+                // if/else; it is the setup block for a generic-for loop.
+                // Detect it and route to emit_generic_for instead of emit_if.
+                let is_tfor_setup = is_conditional
+                    && get_opcode(self.proto.code[bb.end - 1]) == OpCode::LuaDecTForLoop
+                    && target_pc > bb.end
+                    && get_opcode(self.proto.code[cfg.graph[target_node].end])
+                        == OpCode::TForLoop;
+
+                if is_tfor_setup {
+                    self.emit_generic_for(cfg, doms, node, target_node, stop_at, visited);
+                } else if is_conditional {
                     self.emit_if(cfg, doms, node, stop_at, visited);
                 } else if target_pc > bb.end
                     && get_opcode(self.proto.code[cfg.graph[target_node].end])
@@ -526,17 +570,33 @@ impl<'p> DecompileCtx<'p> {
             }
         }
 
-        // Number of loop variables: C field of TFORCALL (LuaDecTForLoop),
-        // which sits just before TFORLOOP in the same block.
-        let loop_var_count = if tfl_bb.end > tfl_bb.start {
-            let tforcall = self.proto.code[tfl_bb.end - 1];
-            if get_opcode(tforcall) == OpCode::LuaDecTForLoop {
-                (getarg_c(tforcall) as usize).max(1)
+        // Number of loop variables: C field of TFORCALL (LuaDecTForLoop).
+        // In non-flattened code TFORCALL sits immediately before TFORLOOP in
+        // the tforloop block.  In CFF-linearized code each instruction has its
+        // own block, so TFORCALL ends up in the *setup* block instead.  Check
+        // both locations and take whichever one yields the instruction.
+        let loop_var_count = {
+            let c_from_tfl = if tfl_bb.end > tfl_bb.start {
+                let instr = self.proto.code[tfl_bb.end - 1];
+                if get_opcode(instr) == OpCode::LuaDecTForLoop {
+                    Some(getarg_c(instr) as usize)
+                } else {
+                    None
+                }
             } else {
-                1
-            }
-        } else {
-            1
+                None
+            };
+            let c_from_setup = if setup_bb.end > setup_bb.start {
+                let instr = self.proto.code[setup_bb.end - 1];
+                if get_opcode(instr) == OpCode::LuaDecTForLoop {
+                    Some(getarg_c(instr) as usize)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            c_from_tfl.or(c_from_setup).unwrap_or(1).max(1)
         };
 
         // Walk the setup block instruction-by-instruction.
@@ -1082,13 +1142,17 @@ impl<'p> DecompileCtx<'p> {
 
         // Build argument string
         let args = if b == 0 {
-            // Variable args: use all non-empty regs above A as best-effort.
-            // Skip registers that were consumed by a preceding SETLIST — those
-            // values are stale table-constructor sources, not call arguments.
+            // Variable args: results from the immediately preceding C=0 CALL/VARARG.
+            // Those results occupy R[A+1..first_empty), because the C=0 instruction
+            // clears its consumed arg registers, leaving a natural empty-register
+            // boundary.  Use take_while(non-empty) so we stop at that boundary and
+            // do NOT scavenge stale loop-variable or intermediate values that happen
+            // to sit in higher registers.  Within the live range, still skip any
+            // registers that were consumed by a preceding SETLIST.
             (a + 1..self.regs.len())
+                .take_while(|&r| !self.reg(r).is_empty())
                 .filter(|&r| !self.setlist_cleared.contains(&r))
                 .map(|r| self.reg(r).to_string())
-                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
@@ -1142,9 +1206,9 @@ impl<'p> DecompileCtx<'p> {
         let func = self.reg(a).to_string();
         let args = if b == 0 {
             (a + 1..self.regs.len())
+                .take_while(|&r| !self.reg(r).is_empty())
                 .filter(|&r| !self.setlist_cleared.contains(&r))
                 .map(|r| self.reg(r).to_string())
-                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
@@ -1225,18 +1289,35 @@ impl<'p> DecompileCtx<'p> {
                 params.push("...".to_string());
             }
 
-            // Resolve each upvalue of the sub-proto to a name using the upvalue
-            // descriptor (`on_stack` + `idx`) and the current register / upvalue state.
-            let resolved: Vec<String> = sub.upvalue_infos.iter().enumerate().map(|(i, desc)| {
-                if desc.on_stack {
-                    // Captured from a register in the current (parent) frame.
-                    let s = self.reg(desc.idx as usize).to_string();
-                    // Only propagate names that are valid Lua lvalues; fall back
-                    // to _upvN for literals like "false"/"true"/arithmetic exprs.
-                    if is_valid_lvalue(&s) { s } else { format!("_upv{}", i) }
+            // Collect upvalue descriptors before mutating self.
+            let descs: Vec<(bool, usize)> = sub.upvalue_infos.iter()
+                .map(|d| (d.on_stack, d.idx as usize))
+                .collect();
+
+            // For on-stack captures whose register holds a non-lvalue expression,
+            // spill the expression into a named local BEFORE the closure definition
+            // so the closure genuinely captures a named variable rather than a
+            // dangling _upvN reference with no definition.
+            for (i, (on_stack, reg_idx)) in descs.iter().enumerate() {
+                if *on_stack {
+                    let s = self.reg(*reg_idx).to_string();
+                    if !is_valid_lvalue(&s) {
+                        let name = format!("_upv{}", i);
+                        self.emit(format!("local {} = {}", name, s));
+                        self.set_reg(*reg_idx, name);
+                    }
+                }
+            }
+
+            // Resolve upvalue names using the now-updated register state.
+            let resolved: Vec<String> = descs.iter().map(|(on_stack, idx)| {
+                if *on_stack {
+                    // Register now holds a valid lvalue (either already was, or
+                    // was just spilled above).
+                    self.reg(*idx).to_string()
                 } else {
                     // Inherited from the current frame's own upvalue.
-                    self.upvalue_name(desc.idx as usize)
+                    self.upvalue_name(*idx)
                 }
             }).collect();
 

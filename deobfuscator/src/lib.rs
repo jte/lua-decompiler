@@ -27,6 +27,7 @@ pub mod pass7_upval;
 pub mod pass8_rename;
 pub mod pass_table_ctor;
 pub mod pass_strdec;
+pub mod pass_stream_dec;
 
 /// Run all deobfuscation passes on a decompiled Lua source string and return
 /// the cleaned-up source.
@@ -63,6 +64,7 @@ pub fn deobfuscate(src: &str) -> String {
 
     // --- Phase D: string reconstruction ---
     let s = pass_strdec::run(&s);           // decrypt _acc14[#_acc14](_tN) calls
+    let s = pass_stream_dec::run(&s);       // decrypt stream-XOR cipher (_f3-style)
     let s = pass4_concat::run(&s);          // collapse "" .. "a" .. "b"
 
     // --- Phase E: final cleanup ---

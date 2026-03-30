@@ -24,9 +24,29 @@ struct Cli {
     /// Decompile and then run all deobfuscation passes on the output.
     #[arg(long)]
     deobfuscate: bool,
+
+    /// Decompile a control-flow-flattened (JMP-spaghetti) binary.
+    /// Applies a CFG linearization pass before decompiling to remove relay JMPs
+    /// and restore sequential execution order.
+    /// Combine with --deobfuscate to also run deobfuscation passes.
+    #[arg(long)]
+    flatten: bool,
 }
 
 fn main() {
+    // The decompiler uses deep recursion (emit_node + op_closure nesting).
+    // Spawn on a thread with a 64 MiB stack to avoid stack overflow on large
+    // or heavily-obfuscated binaries.
+    let exit_code = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run)
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked");
+    std::process::exit(exit_code);
+}
+
+fn run() -> i32 {
     let args = Cli::parse();
 
     let data: Vec<u8> = match fs::read(&args.input_file) {
@@ -37,19 +57,20 @@ fn main() {
         }
     };
 
-    match process_file(&data, args.disassemble, args.decompile, args.dump_cfg, args.deobfuscate) {
+    match process_file(&data, args.disassemble, args.decompile, args.dump_cfg, args.deobfuscate, args.flatten) {
         Ok(output) => {
             if let Err(e) = fs::write(&args.output_file, &output) {
                 eprintln!("Error writing output: {e}");
-                process::exit(1);
+                return 1;
             }
             println!("Done.");
         }
         Err(e) => {
             eprintln!("Error: {e}");
-            process::exit(1);
+            return 1;
         }
     }
+    0
 }
 
 fn dump_chunk(chunk: &luac_parser::LuaChunk, depth: usize) {
@@ -77,6 +98,7 @@ fn process_file(
     decompile: bool,
     dump_cfg: bool,
     deobfuscate: bool,
+    flatten: bool,
 ) -> Result<Vec<u8>, String> {
     match luac_parser::parse(data) {
         Ok(parsed) => {
@@ -92,6 +114,15 @@ fn process_file(
             if dump_cfg {
                 let cfg = decompiler::cfg::Cfg::build(&proto);
                 return Ok(cfg.to_dot().into_bytes());
+            }
+
+            if flatten {
+                let source = decompiler::decompile_cff(&proto);
+                if deobfuscate {
+                    let clean = deobfuscator::deobfuscate(&source);
+                    return Ok(clean.into_bytes());
+                }
+                return Ok(source.into_bytes());
             }
 
             if decompile || deobfuscate {
