@@ -28,6 +28,7 @@ pub mod pass8_rename;
 pub mod pass_table_ctor;
 pub mod pass_strdec;
 pub mod pass_stream_dec;
+pub mod pass_inline_locals;
 
 /// Run all deobfuscation passes on a decompiled Lua source string and return
 /// the cleaned-up source.
@@ -68,6 +69,7 @@ pub fn deobfuscate(src: &str) -> String {
     let s = pass4_concat::run(&s);          // collapse "" .. "a" .. "b"
 
     // --- Phase E: final cleanup ---
+    let s = pass_inline_locals::run(&s);    // inline single-use _tNNNN locals
     let s = pass6_dead::run(&s);            // second dead-code sweep
     pass8_rename::run(&s)                   // rename module-holding vars
 }
