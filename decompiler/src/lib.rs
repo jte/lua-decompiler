@@ -343,6 +343,9 @@ impl<'p> DecompileCtx<'p> {
     // -----------------------------------------------------------------------
 
     pub fn run(&mut self) {
+        if self.proto.code.is_empty() {
+            return;
+        }
         let cfg = Cfg::build(self.proto);
         if cfg.graph.node_count() == 0 {
             return;
@@ -1301,7 +1304,10 @@ impl<'p> DecompileCtx<'p> {
             for (i, (on_stack, reg_idx)) in descs.iter().enumerate() {
                 if *on_stack {
                     let s = self.reg(*reg_idx).to_string();
-                    if !is_valid_lvalue(&s) {
+                    // Only spill if the register holds a real (non-empty, non-nil)
+                    // expression that isn't already a valid lvalue.
+                    // Empty / "nil" means the register is unresolved — don't spill.
+                    if !s.is_empty() && s != "nil" && !is_valid_lvalue(&s) {
                         let name = format!("_upv{}", i);
                         self.emit(format!("local {} = {}", name, s));
                         self.set_reg(*reg_idx, name);
@@ -1310,11 +1316,22 @@ impl<'p> DecompileCtx<'p> {
             }
 
             // Resolve upvalue names using the now-updated register state.
-            let resolved: Vec<String> = descs.iter().map(|(on_stack, idx)| {
+            // If an on-stack register is still unresolved (empty or "nil"),
+            // fall back to the sub-proto's upvalue_names[i] (synthetic names
+            // written by the sanitizer) so the closure body uses a readable name.
+            let resolved: Vec<String> = descs.iter().enumerate().map(|(i, (on_stack, idx))| {
                 if *on_stack {
-                    // Register now holds a valid lvalue (either already was, or
-                    // was just spilled above).
-                    self.reg(*idx).to_string()
+                    let r = self.reg(*idx).to_string();
+                    if r.is_empty() || r == "nil" {
+                        // Unresolved capture — use sub-proto's synthetic name.
+                        sub.upvalue_names
+                            .get(i)
+                            .filter(|n| !n.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("_upv{}", i))
+                    } else {
+                        r
+                    }
                 } else {
                     // Inherited from the current frame's own upvalue.
                     self.upvalue_name(*idx)
