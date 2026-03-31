@@ -122,7 +122,7 @@ fn detect_cipher_instances(src: &str) -> Vec<CipherInstance> {
     // Regex to extract the function name from `local <name> = function(`.
     let re_fn_decl = Regex::new(r"local\s+(\w+)\s*=\s*function\s*\(").unwrap();
 
-    for (li, &(line_off, line)) in lines.iter().enumerate() {
+    for (li, &(_line_off, line)) in lines.iter().enumerate() {
         let caps = match re_xor.captures(line) {
             Some(c) => c,
             None => continue,

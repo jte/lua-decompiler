@@ -10,7 +10,7 @@
 /// This pass collects such integer-only tables and substitutes `_tN[M]` with
 /// the known value wherever M is a literal integer index.
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn run(src: &str) -> String {
     let tables = collect_integer_tables(src);
@@ -22,12 +22,12 @@ pub fn run(src: &str) -> String {
 
 /// Returns `table_name → { index → value }` for tables whose every entry is
 /// an integer literal assigned via `_tN[M] = VALUE`.
-fn collect_integer_tables(src: &str) -> HashMap<String, HashMap<usize, i64>> {
+fn collect_integer_tables(src: &str) -> BTreeMap<String, BTreeMap<usize, i64>> {
     let re_entry = Regex::new(r"^\s*(_t\d+)\[(\d+)\]\s*=\s*(-?\d+)\s*$").unwrap();
     let re_decl  = Regex::new(r"^\s*local\s+(_t\d+)\s*=\s*\{\}\s*$").unwrap();
 
     // Find all locally-declared empty tables
-    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut known: BTreeSet<String> = BTreeSet::new();
     for line in src.lines() {
         if let Some(c) = re_decl.captures(line) {
             known.insert(c[1].to_string());
@@ -35,7 +35,7 @@ fn collect_integer_tables(src: &str) -> HashMap<String, HashMap<usize, i64>> {
     }
 
     // Collect entries
-    let mut tables: HashMap<String, HashMap<usize, i64>> = HashMap::new();
+    let mut tables: BTreeMap<String, BTreeMap<usize, i64>> = BTreeMap::new();
     for line in src.lines() {
         if let Some(c) = re_entry.captures(line) {
             let tname = c[1].to_string();
@@ -51,7 +51,7 @@ fn collect_integer_tables(src: &str) -> HashMap<String, HashMap<usize, i64>> {
     // re_entry only matched integer values, so any _tN[M] = NON_INT line taints the table.
     let re_any_entry = Regex::new(r"^\s*(_t\d+)\[(\d+)\]\s*=\s*(.+)$").unwrap();
     let re_int_val   = Regex::new(r"^-?\d+$").unwrap();
-    let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tainted: BTreeSet<String> = BTreeSet::new();
     for line in src.lines() {
         if let Some(c) = re_any_entry.captures(line) {
             let tname = c[1].to_string();
@@ -65,7 +65,7 @@ fn collect_integer_tables(src: &str) -> HashMap<String, HashMap<usize, i64>> {
     tables
 }
 
-fn substitute(src: &str, tables: &HashMap<String, HashMap<usize, i64>>) -> String {
+fn substitute(src: &str, tables: &BTreeMap<String, BTreeMap<usize, i64>>) -> String {
     let mut s = src.to_string();
     for (tname, entries) in tables {
         let pat = format!(r"(?:^|(?P<pre>[^a-zA-Z0-9_])){}(?:\[(\d+)\])", regex::escape(tname));

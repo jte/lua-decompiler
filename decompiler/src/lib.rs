@@ -1,7 +1,7 @@
 pub mod cfg;
 pub mod linearize;
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use petgraph::algo::dominators::Dominators;
 use petgraph::graph::NodeIndex;
@@ -53,7 +53,7 @@ pub struct DecompileCtx<'p> {
     /// Registers that are loop-carried accumulators in the innermost active loop.
     /// Expression-building ops that write to these emit an assignment statement
     /// instead of (silently) updating the register expression string.
-    pub loop_carried_regs: HashSet<usize>,
+    pub loop_carried_regs: BTreeSet<usize>,
     /// Resolved upvalue names supplied by the parent context when creating this
     /// sub-context for a closure.  When non-empty, takes precedence over
     /// `proto.upvalue_names` for naming upvalue operands.
@@ -63,7 +63,7 @@ pub struct DecompileCtx<'p> {
     /// still read them, but CALL/TAILCALL/RETURN B=0 sweeps skip these registers
     /// to avoid treating SETLIST sources as phantom call arguments.
     /// Cleared when any instruction writes to the register again.
-    pub setlist_cleared: HashSet<usize>,
+    pub setlist_cleared: BTreeSet<usize>,
     /// Names that were assigned to for-loop variables (by `emit_generic_for` or
     /// the ForPrep handler).  These names are only valid inside the loop body;
     /// after the loop they are out-of-scope in Lua source.
@@ -71,7 +71,7 @@ pub struct DecompileCtx<'p> {
     /// loop-variable name — even if the name reached the register via a MOVE
     /// rather than directly from the for-loop header — and needs a new shared
     /// `local` variable instead.
-    pub loop_var_names: HashSet<String>,
+    pub loop_var_names: BTreeSet<String>,
 }
 
 impl<'p> DecompileCtx<'p> {
@@ -82,10 +82,10 @@ impl<'p> DecompileCtx<'p> {
             indent,
             output: Vec::new(),
             regs: vec![String::new(); maxstack.max(1)],
-            loop_carried_regs: HashSet::new(),
+            loop_carried_regs: BTreeSet::new(),
             upvalue_names: Vec::new(),
-            setlist_cleared: HashSet::new(),
-            loop_var_names: HashSet::new(),
+            setlist_cleared: BTreeSet::new(),
+            loop_var_names: BTreeSet::new(),
         }
     }
 
@@ -176,14 +176,14 @@ impl<'p> DecompileCtx<'p> {
         exit_node: Option<NodeIndex>,
         ctrl_reg: usize,
         loop_var_count: usize,
-    ) -> HashSet<usize> {
+    ) -> BTreeSet<usize> {
         // Step 1 — find registers that receive loop-variable values in the body.
-        let loop_var_set: HashSet<usize> =
+        let loop_var_set: BTreeSet<usize> =
             (ctrl_reg + 1..=ctrl_reg + loop_var_count).collect();
-        let mut derived: HashSet<usize> = HashSet::new();
+        let mut derived: BTreeSet<usize> = BTreeSet::new();
         if let Some(start) = body_node {
             let mut worklist = vec![start];
-            let mut seen: HashSet<NodeIndex> = HashSet::new();
+            let mut seen: BTreeSet<NodeIndex> = BTreeSet::new();
             while let Some(n) = worklist.pop() {
                 if n == stop_node || seen.contains(&n) { continue; }
                 seen.insert(n);
@@ -203,11 +203,11 @@ impl<'p> DecompileCtx<'p> {
                 }
             }
         }
-        if derived.is_empty() { return HashSet::new(); }
+        if derived.is_empty() { return BTreeSet::new(); }
 
         // Step 2 — scan the exit node for CLOSURE instructions whose upvalue
         // descriptors reference any of the derived registers.
-        let mut promoted: HashSet<usize> = HashSet::new();
+        let mut promoted: BTreeSet<usize> = BTreeSet::new();
         if let Some(exit) = exit_node {
             let bb = &cfg.graph[exit];
             for pc in bb.start..=bb.end {
@@ -234,10 +234,10 @@ impl<'p> DecompileCtx<'p> {
         stop_node: NodeIndex,
         pre_loop_regs: &[String],
         exclude: &[usize],
-    ) -> HashSet<usize> {
+    ) -> BTreeSet<usize> {
         // Collect all reachable body nodes (stopping at stop_node / back-edges).
         let mut body_nodes: Vec<NodeIndex> = Vec::new();
-        let mut seen: HashSet<NodeIndex> = HashSet::new();
+        let mut seen: BTreeSet<NodeIndex> = BTreeSet::new();
         let mut worklist = vec![body_start];
         while let Some(node) = worklist.pop() {
             if node == stop_node || seen.contains(&node) {
@@ -258,11 +258,11 @@ impl<'p> DecompileCtx<'p> {
         // preventing over-eager loop-carried marking.
         body_nodes.sort_by_key(|&n| cfg.graph[n].start);
 
-        let mut carried: HashSet<usize> = HashSet::new();
+        let mut carried: BTreeSet<usize> = BTreeSet::new();
         // Use a GLOBAL written set that accumulates across all body blocks processed
         // in PC order.  This correctly handles writes in block A being visible when
         // block B (a later block that reads the same register) is processed.
-        let mut written: HashSet<usize> = HashSet::new();
+        let mut written: BTreeSet<usize> = BTreeSet::new();
 
         for node in body_nodes {
             let bb = &cfg.graph[node];
@@ -349,7 +349,7 @@ impl<'p> DecompileCtx<'p> {
         }
 
         let doms = cfg.dominators();
-        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        let mut visited: BTreeSet<NodeIndex> = BTreeSet::new();
         self.emit_node(&cfg, &doms, cfg.entry, None, &mut visited);
     }
 
@@ -363,7 +363,7 @@ impl<'p> DecompileCtx<'p> {
         doms: &Dominators<NodeIndex>,
         node: NodeIndex,
         stop_at: Option<NodeIndex>,
-        visited: &mut HashSet<NodeIndex>,
+        visited: &mut BTreeSet<NodeIndex>,
     ) {
         if Some(node) == stop_at || visited.contains(&node) {
             return;
@@ -412,7 +412,7 @@ impl<'p> DecompileCtx<'p> {
                         cfg, body, forloop_node, &pre_loop_regs, &exclude_for,
                     )
                 } else {
-                    HashSet::new()
+                    BTreeSet::new()
                 };
                 for &r in &carried {
                     let acc = format!("_acc{}", r);
@@ -541,7 +541,7 @@ impl<'p> DecompileCtx<'p> {
         setup_node: NodeIndex,
         tforloop_node: NodeIndex,
         stop_at: Option<NodeIndex>,
-        visited: &mut HashSet<NodeIndex>,
+        visited: &mut BTreeSet<NodeIndex>,
     ) {
         visited.insert(setup_node);
         visited.insert(tforloop_node);
@@ -666,7 +666,7 @@ impl<'p> DecompileCtx<'p> {
                 cfg, body, tforloop_node, &pre_loop_regs, &exclude_tfor,
             )
         } else {
-            HashSet::new()
+            BTreeSet::new()
         };
         for &r in &carried {
             let acc = format!("_acc{}", r);
@@ -728,7 +728,7 @@ impl<'p> DecompileCtx<'p> {
         doms: &Dominators<NodeIndex>,
         node: NodeIndex,
         stop_at: Option<NodeIndex>,
-        visited: &mut HashSet<NodeIndex>,
+        visited: &mut BTreeSet<NodeIndex>,
     ) {
         let bb = cfg.graph[node].clone();
 
@@ -797,7 +797,7 @@ impl<'p> DecompileCtx<'p> {
     fn find_region_end(
         &self,
         cfg: &Cfg,
-        region: &HashSet<NodeIndex>,
+        region: &BTreeSet<NodeIndex>,
         default_end: NodeIndex,
     ) -> NodeIndex {
         let default_pc = cfg.graph[default_end].start;
@@ -821,8 +821,8 @@ impl<'p> DecompileCtx<'p> {
         cfg: &Cfg,
         start: NodeIndex,
         stop: NodeIndex,
-    ) -> HashSet<NodeIndex> {
-        let mut result   = HashSet::new();
+    ) -> BTreeSet<NodeIndex> {
+        let mut result   = BTreeSet::new();
         let mut worklist = vec![start];
         while let Some(n) = worklist.pop() {
             if n == stop || result.contains(&n) {

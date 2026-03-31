@@ -61,9 +61,7 @@ fn apply(src: &str, pat: &str, op: impl Fn(i64, i64) -> Option<i64>) -> String {
 /// Addition fold that is context-aware: skips `A + B` when `A` is the
 /// RHS of a higher-precedence operator (`%`, `*`, `/`, `//`, `^`).
 fn apply_add(src: &str) -> String {
-    let re = Regex::new(r"\b(\d+)\s*\+\s*(\d+)\b").unwrap();
     let mut result = String::new();
-    let mut last_end = 0;
     /*for cap in re.captures_iter(src) {
         let m = cap.get(0).unwrap();
         let start = m.start();

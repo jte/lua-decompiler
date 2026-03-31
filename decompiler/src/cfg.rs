@@ -10,7 +10,7 @@
 //!         └─► natural_loops() — back-edge based loop detection
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use petgraph::{
     algo::dominators::{self, Dominators},
@@ -136,7 +136,7 @@ impl Cfg {
 
         let mut graph: DiGraph<BasicBlock, EdgeKind> = DiGraph::new();
         let mut block_of = vec![NodeIndex::new(0); n];
-        let mut leader_to_node: HashMap<usize, NodeIndex> = HashMap::new();
+        let mut leader_to_node: BTreeMap<usize, NodeIndex> = BTreeMap::new();
 
         for (i, &start) in leaders.iter().enumerate() {
             let end = leaders.get(i + 1).map(|&l| l - 1).unwrap_or(n - 1);
@@ -232,11 +232,11 @@ impl Cfg {
     pub fn dominance_frontiers(
         &self,
         doms: &Dominators<NodeIndex>,
-    ) -> HashMap<NodeIndex, HashSet<NodeIndex>> {
-        let mut df: HashMap<NodeIndex, HashSet<NodeIndex>> = self
+    ) -> BTreeMap<NodeIndex, BTreeSet<NodeIndex>> {
+        let mut df: BTreeMap<NodeIndex, BTreeSet<NodeIndex>> = self
             .graph
             .node_indices()
-            .map(|n| (n, HashSet::new()))
+            .map(|n| (n, BTreeSet::new()))
             .collect();
 
         for n in self.graph.node_indices() {
@@ -278,7 +278,7 @@ impl Cfg {
     ///
     /// Returns a `Vec` of `(header, body)` pairs where `body` is the full set of
     /// nodes in the natural loop, including `header`.
-    pub fn natural_loops(&self) -> Vec<(NodeIndex, HashSet<NodeIndex>)> {
+    pub fn natural_loops(&self) -> Vec<(NodeIndex, BTreeSet<NodeIndex>)> {
         self.graph
             .edge_references()
             .filter(|e| *e.weight() == EdgeKind::Back)
@@ -294,8 +294,8 @@ impl Cfg {
     ///
     /// Walks backwards from `tail` through the CFG, collecting all nodes that
     /// can reach `tail` without going through `header`.
-    fn loop_body(&self, header: NodeIndex, tail: NodeIndex) -> HashSet<NodeIndex> {
-        let mut body = HashSet::from([header]);
+    fn loop_body(&self, header: NodeIndex, tail: NodeIndex) -> BTreeSet<NodeIndex> {
+        let mut body = BTreeSet::from([header]);
         let mut worklist = vec![tail];
 
         while let Some(n) = worklist.pop() {
@@ -386,7 +386,7 @@ fn mark_leader(is_leader: &mut Vec<bool>, n: usize, pc: usize) {
 fn add_edge_to(
     graph: &mut DiGraph<BasicBlock, EdgeKind>,
     src: NodeIndex,
-    leader_to_node: &HashMap<usize, NodeIndex>,
+    leader_to_node: &BTreeMap<usize, NodeIndex>,
     target_pc: usize,
     kind: EdgeKind,
 ) {

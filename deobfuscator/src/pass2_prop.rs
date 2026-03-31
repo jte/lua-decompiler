@@ -5,7 +5,7 @@
 /// literals and simple single-quoted or double-quoted string literals that
 /// contain no embedded quotes.  Variables that are ever reassigned are skipped.
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn run(src: &str) -> String {
     let consts = collect_consts(src);
@@ -16,7 +16,7 @@ pub fn run(src: &str) -> String {
 }
 
 /// Returns `name → literal_expr` for safe single-assignment locals.
-fn collect_consts(src: &str) -> HashMap<String, String> {
+fn collect_consts(src: &str) -> BTreeMap<String, String> {
     let re_decl = Regex::new(
         r#"(?m)^\s*local\s+(_[a-zA-Z]\w*)\s*=\s*(-?\d+(?:\.\d+)?|"[^"\\]*")\s*$"#,
     )
@@ -25,13 +25,13 @@ fn collect_consts(src: &str) -> HashMap<String, String> {
     let re_assign = Regex::new(r"^\s*(_[a-zA-Z]\w*)\s*=").unwrap();
 
     // Collect declarations
-    let mut decls: HashMap<String, String> = HashMap::new();
+    let mut decls: BTreeMap<String, String> = BTreeMap::new();
     for caps in re_decl.captures_iter(src) {
         decls.insert(caps[1].to_string(), caps[2].to_string());
     }
 
     // Find all names that are reassigned (line starts with `_NAME =`, not `local`)
-    let mut reassigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reassigned: BTreeSet<String> = BTreeSet::new();
     for line in src.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("local ") {
@@ -47,7 +47,7 @@ fn collect_consts(src: &str) -> HashMap<String, String> {
     decls
 }
 
-fn substitute(src: &str, consts: &HashMap<String, String>) -> String {
+fn substitute(src: &str, consts: &BTreeMap<String, String>) -> String {
     let mut s = src.to_string();
     for (name, value) in consts {
         // Replace word-boundary occurrences of `name` that are not in a `local NAME =` declaration line
