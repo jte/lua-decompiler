@@ -1,291 +1,165 @@
 /// Pass – Inline single-use local table declarations.
 ///
-/// Finds patterns of the form:
-///
-/// ```lua
-/// local _tNNNN = { ... }   ← declaration (single- or multi-line)
-/// ...
-/// somevar[k] = _tNNNN      ← exactly one use as RHS of assignment
-/// ```
-///
-/// and replaces them with:
-///
-/// ```lua
-/// somevar[k] = { ... }
-/// ```
-///
-/// removing the `local _tNNNN = { ... }` declaration entirely.
-///
-/// Conditions for inlining:
-///   - The variable name matches `_t\d+`.
-///   - The name appears exactly twice in the source: once in the declaration
-///     and once at the use site.
-///   - The use site is a plain assignment RHS: preceded by `= ` and not part
-///     of `==`, `~=`, `<=`, `>=`.
-///   - The declaration is either a single-line `local _tN = { ... }` or a
-///     multi-line block `local _tN = {\n...\n}`.
+/// Finds `local _tN = { ... }` where `_tN` appears exactly twice in the block
+/// (the declaration and exactly one use as an assignment RHS).
+/// Replaces the use with the constructor and removes the declaration.
 
-use regex::Regex;
+use lua_ast::{Block, Expr, Stat, TableField};
+use crate::for_each_block;
 
-pub fn run(src: &str) -> String {
-    // Iterate to a fixed point: each pass may inline one or more variables.
-    // In practice one pass should be sufficient, but iterating is safe.
-    let mut s = src.to_string();
-    loop {
-        let next = run_once(&s);
-        if next == s {
-            break;
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut |b| {
+        loop {
+            let before = b.len();
+            inline_once(b);
+            if b.len() == before { break; }
         }
-        s = next;
-    }
-    s
-}
-
-fn run_once(src: &str) -> String {
-    let decls = collect_decls(src);
-    if decls.is_empty() {
-        return src.to_string();
-    }
-
-    // Build list of (decl_start, decl_end, name, body_expr) where
-    // the name appears exactly twice in source (decl + one use) and the use
-    // is a plain assignment RHS.
-    let mut replacements: Vec<(usize, usize, String, String)> = Vec::new();
-
-    for d in &decls {
-        if !is_single_use(src, &d.name) {
-            continue;
-        }
-        if let Some(use_pos) = find_rhs_use(src, &d.name) {
-            // Exclude the occurrence inside the declaration itself.
-            if use_pos >= d.decl_start && use_pos < d.decl_end {
-                continue;
-            }
-            replacements.push((d.decl_start, d.decl_end, d.name.clone(), d.body_expr.clone()));
-        }
-    }
-
-    if replacements.is_empty() {
-        return src.to_string();
-    }
-
-    // Apply replacements: first substitute uses (right-to-left by use position),
-    // then delete declarations (right-to-left by declaration position).
-    // We do this in two passes to avoid offset invalidation.
-
-    // Collect use positions for substitution.
-    let mut use_subs: Vec<(usize, usize, String)> = Vec::new();
-    for (_, _, name, body_expr) in &replacements {
-        if let Some(use_pos) = find_rhs_use(src, name) {
-            // Use position is the start of the name in src.
-            let use_end = use_pos + name.len();
-            use_subs.push((use_pos, use_end, body_expr.clone()));
-        }
-    }
-
-    // Collect declaration removals.
-    let del_ranges: Vec<(usize, usize)> = replacements
-        .iter()
-        .map(|(s, e, _, _)| (*s, *e))
-        .collect();
-
-    // Combine and apply right-to-left.
-    let mut all_edits: Vec<(usize, usize, String)> = Vec::new();
-    for (s, e, rep) in use_subs {
-        all_edits.push((s, e, rep));
-    }
-    for (s, e) in del_ranges {
-        all_edits.push((s, e, String::new()));
-    }
-
-    // Sort right-to-left by start position, with deletions before substitutions
-    // at the same position (so the substitution offset isn't shifted by the delete).
-    all_edits.sort_by(|a, b| {
-        b.0.cmp(&a.0).then_with(|| a.2.len().cmp(&b.2.len()))
     });
-
-    let mut result = src.to_string();
-    for (start, end, rep) in all_edits {
-        if start <= end && end <= result.len() {
-            result.replace_range(start..end, &rep);
-        }
-    }
-    result
 }
 
-// ---------------------------------------------------------------------------
-// Declaration collection
-// ---------------------------------------------------------------------------
-
-struct Decl {
-    /// Byte offset of the start of the `local _tN` line.
-    decl_start: usize,
-    /// Byte offset just past the closing `}` line (including its `\n`).
-    decl_end: usize,
-    /// Variable name, e.g. `_t8650`.
-    name: String,
-    /// The table constructor expression to inline, e.g. `{\n  300, 392,\n}`.
-    body_expr: String,
-}
-
-fn collect_decls(src: &str) -> Vec<Decl> {
-    let mut result = Vec::new();
-
-    // Build line table.
-    let mut lines: Vec<(usize, &str)> = Vec::new();
-    let mut offset = 0usize;
-    for line in src.split('\n') {
-        lines.push((offset, line.trim_end_matches('\r')));
-        offset += line.len() + 1;
-    }
-
-    // Single-line: `local _tNNNN = { ... }`
-    let re_single = Regex::new(r"^\s*local\s+(_t\d+)\s*=\s*(\{[^}]*\})\s*$").unwrap();
-    // Multi-line open: `local _tNNNN = {`
-    let re_open = Regex::new(r"^\s*local\s+(_t\d+)\s*=\s*\{\s*$").unwrap();
-
-    let mut i = 0;
-    while i < lines.len() {
-        let (line_start, line) = lines[i];
-
-        // Single-line form.
-        if let Some(caps) = re_single.captures(line) {
-            let name = caps[1].to_string();
-            let body_expr = caps[2].to_string();
-            let line_end = (line_start + line.len() + 1).min(src.len());
-            result.push(Decl {
-                decl_start: line_start,
-                decl_end: line_end,
-                name,
-                body_expr,
-            });
-            i += 1;
-            continue;
-        }
-
-        // Multi-line form: collect until closing `}`.
-        if let Some(caps) = re_open.captures(line) {
-            let name = caps[1].to_string();
-            let decl_start = line_start;
-
-            // Determine indentation of the opening line (for the closing `}`).
-            let open_indent = line.len() - line.trim_start().len();
-
-            let mut body_lines: Vec<&str> = Vec::new();
-            body_lines.push("{");
-            i += 1;
-            let mut found_close = false;
-            while i < lines.len() {
-                let (close_start, l) = lines[i];
-                let l_trimmed = l.trim();
-                // The closing `}` must be at the same indentation as the opening line,
-                // possibly followed by a comma or nothing.
-                let l_indent = l.len() - l.trim_start().len();
-                if l_trimmed == "}" || l_trimmed == "}," {
-                    if l_indent == open_indent || l_trimmed == "}" || l_trimmed == "}," {
-                        let decl_end = (close_start + l.len() + 1).min(src.len());
-                        body_lines.push(l_trimmed);
-                        let body_expr = body_lines.join("\n");
-                        result.push(Decl {
-                            decl_start,
-                            decl_end,
-                            name,
-                            body_expr,
-                        });
-                        found_close = true;
-                        i += 1;
-                        break;
-                    }
+fn inline_once(block: &mut Block) {
+    // Find all `local _tN = { ... }` declarations (table vars starting with `_t`).
+    let decls: Vec<(usize, String, Expr)> = block.iter().enumerate().filter_map(|(i, s)| {
+        if let Stat::Local { names, values } = s {
+            if names.len() == 1 && names[0].starts_with("_t") && values.len() == 1 {
+                if matches!(&values[0], Expr::Table(_)) {
+                    return Some((i, names[0].clone(), values[0].clone()));
                 }
-                body_lines.push(l_trimmed);
-                i += 1;
             }
-            if !found_close {
-                // Malformed — skip.
-            }
-            continue;
         }
+        None
+    }).collect();
 
-        i += 1;
+    for (decl_idx, tname, body) in decls {
+        // Count whole-word occurrences of tname in the block.
+        let count = count_name_in_block(block, &tname);
+        if count != 2 { continue; } // exactly decl + one use
+
+        // Find the use site (must be an RHS of an assignment).
+        let use_idx = match find_rhs_use(block, &tname, decl_idx) {
+            Some(i) => i,
+            None => continue,
+        };
+
+        // Substitute tname at the use site.
+        subst_rhs(block, use_idx, &tname, body);
+
+        // Remove the declaration (index may have shifted if use_idx < decl_idx).
+        let actual_decl = if use_idx < decl_idx { decl_idx - 0 } else { decl_idx };
+        if actual_decl < block.len() {
+            block.remove(actual_decl);
+        }
+        return; // One at a time; loop will repeat.
     }
-
-    result
 }
 
-// ---------------------------------------------------------------------------
-// Use-site detection
-// ---------------------------------------------------------------------------
-
-/// Return true iff `name` appears exactly twice as a whole word in `src`
-/// (once in the declaration and once at the use site).
-fn is_single_use(src: &str, name: &str) -> bool {
-    count_word_occurrences(src, name) == 2
+fn count_name_in_block(block: &Block, name: &str) -> usize {
+    block.iter().map(|s| count_name_in_stat(s, name)).sum()
 }
 
-fn count_word_occurrences(src: &str, name: &str) -> usize {
-    let mut count = 0;
-    let mut start = 0;
-    while let Some(pos) = src[start..].find(name) {
-        let abs = start + pos;
-        if is_word_boundary(src, abs, name.len()) {
-            count += 1;
+fn count_name_in_stat(stat: &Stat, name: &str) -> usize {
+    match stat {
+        Stat::Local { names, values } => {
+            let in_decl = if names.contains(&name.to_string()) { 1 } else { 0 };
+            let in_vals: usize = values.iter().map(|v| count_name_in_expr(v, name)).sum();
+            in_decl + in_vals
         }
-        start = abs + 1;
+        Stat::Assign { lhs, rhs } => {
+            lhs.iter().map(|e| count_name_in_expr(e, name)).sum::<usize>()
+                + rhs.iter().map(|e| count_name_in_expr(e, name)).sum::<usize>()
+        }
+        Stat::Return(vals) => vals.iter().map(|v| count_name_in_expr(v, name)).sum(),
+        Stat::Call(e) => count_name_in_expr(e, name),
+        // Recurse into nested blocks, including loop/condition headers.
+        Stat::Do(b) => b.iter().map(|s| count_name_in_stat(s, name)).sum(),
+        Stat::While { cond, body } => {
+            count_name_in_expr(cond, name)
+                + body.iter().map(|s| count_name_in_stat(s, name)).sum::<usize>()
+        }
+        Stat::Repeat { body, cond } => {
+            body.iter().map(|s| count_name_in_stat(s, name)).sum::<usize>()
+                + count_name_in_expr(cond, name)
+        }
+        Stat::NumFor { from, to, step, body, .. } => {
+            count_name_in_expr(from, name)
+                + count_name_in_expr(to, name)
+                + step.as_ref().map_or(0, |s| count_name_in_expr(s, name))
+                + body.iter().map(|s| count_name_in_stat(s, name)).sum::<usize>()
+        }
+        Stat::GenFor { iters, body, .. } => {
+            iters.iter().map(|e| count_name_in_expr(e, name)).sum::<usize>()
+                + body.iter().map(|s| count_name_in_stat(s, name)).sum::<usize>()
+        }
+        Stat::If { branches, else_body } => {
+            let in_branches: usize = branches.iter()
+                .map(|(cond, b)| {
+                    count_name_in_expr(cond, name)
+                        + b.iter().map(|s| count_name_in_stat(s, name)).sum::<usize>()
+                })
+                .sum();
+            let in_else: usize = else_body.iter()
+                .flat_map(|b| b.iter())
+                .map(|s| count_name_in_stat(s, name))
+                .sum();
+            in_branches + in_else
+        }
+        _ => 0,
     }
-    count
 }
 
-fn is_word_boundary(src: &str, start: usize, len: usize) -> bool {
-    let end = start + len;
-    let before_ok = start == 0 || {
-        let b = src.as_bytes()[start - 1];
-        !b.is_ascii_alphanumeric() && b != b'_'
-    };
-    let after_ok = end >= src.len() || {
-        let b = src.as_bytes()[end];
-        !b.is_ascii_alphanumeric() && b != b'_'
-    };
-    before_ok && after_ok
+fn count_name_in_expr(e: &Expr, name: &str) -> usize {
+    match e {
+        Expr::Name(n) => if n == name { 1 } else { 0 },
+        Expr::Index { table, key } =>
+            count_name_in_expr(table, name) + count_name_in_expr(key, name),
+        Expr::BinOp { lhs, rhs, .. } =>
+            count_name_in_expr(lhs, name) + count_name_in_expr(rhs, name),
+        Expr::UnOp { operand, .. } => count_name_in_expr(operand, name),
+        Expr::Call { func, args } =>
+            count_name_in_expr(func, name) + args.iter().map(|a| count_name_in_expr(a, name)).sum::<usize>(),
+        Expr::Table(fields) => fields.iter().map(|f| match f {
+            TableField::IndexField(k, v) =>
+                count_name_in_expr(k, name) + count_name_in_expr(v, name),
+            TableField::NameField(_, v) => count_name_in_expr(v, name),
+            TableField::ValueField(v) => count_name_in_expr(v, name),
+        }).sum(),
+        _ => 0,
+    }
 }
 
-/// Find the byte position of the use of `name` as an assignment RHS.
-/// The use must be preceded (ignoring whitespace) by a bare `=` (not `==`,
-/// `~=`, `<=`, `>=`).
-fn find_rhs_use(src: &str, name: &str) -> Option<usize> {
-    let mut start = 0;
-    while let Some(pos) = src[start..].find(name) {
-        let abs = start + pos;
-        if is_word_boundary(src, abs, name.len()) && is_rhs_position(src, abs) {
-            return Some(abs);
-        }
-        start = abs + 1;
+/// Find the index of a statement where `name` appears as an RHS (not decl).
+fn find_rhs_use(block: &Block, name: &str, skip_idx: usize) -> Option<usize> {
+    for (i, stat) in block.iter().enumerate() {
+        if i == skip_idx { continue; }
+        let is_rhs = match stat {
+            Stat::Assign { rhs, .. } => rhs.iter().any(|e| expr_contains_name_top(e, name)),
+            Stat::Return(vals) => vals.iter().any(|e| expr_contains_name_top(e, name)),
+            Stat::Local { values, .. } => values.iter().any(|e| expr_contains_name_top(e, name)),
+            Stat::Call(e) => expr_contains_name_top(e, name),
+            _ => false,
+        };
+        if is_rhs { return Some(i); }
     }
     None
 }
 
-/// Return true iff the character immediately preceding `pos` (skipping
-/// whitespace) is a bare `=` (not `==`, `~=`, `<=`, `>=`).
-fn is_rhs_position(src: &str, pos: usize) -> bool {
-    if pos == 0 {
-        return false;
+fn expr_contains_name_top(e: &Expr, name: &str) -> bool {
+    count_name_in_expr(e, name) > 0
+}
+
+fn subst_rhs(block: &mut Block, idx: usize, name: &str, replacement: Expr) {
+    let subst = &mut |e: &mut Expr| {
+        lua_ast::transform_expr(e, &mut |node| {
+            if let Expr::Name(n) = node {
+                if n == name { *node = replacement.clone(); }
+            }
+        });
+    };
+    match &mut block[idx] {
+        Stat::Assign { rhs, .. } => { for e in rhs { subst(e); } }
+        Stat::Local { values, .. } => { for v in values { subst(v); } }
+        Stat::Return(vals) => { for v in vals { subst(v); } }
+        Stat::Call(e) => subst(e),
+        _ => {}
     }
-    let before = &src[..pos];
-    let trimmed = before.trim_end();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let last_bytes = trimmed.as_bytes();
-    let n = last_bytes.len();
-    // Must end with `=`.
-    if last_bytes[n - 1] != b'=' {
-        return false;
-    }
-    // Must not be `==`, `~=`, `<=`, `>=`.
-    if n >= 2 {
-        let prev = last_bytes[n - 2];
-        if prev == b'=' || prev == b'~' || prev == b'<' || prev == b'>' {
-            return false;
-        }
-    }
-    true
 }

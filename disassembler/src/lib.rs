@@ -1,4 +1,5 @@
-use luac_parser::{LuaChunk, LuaConstant, LuaNumber, UpVal};
+pub use luac_parser::{LuaConstant, LuaNumber};
+use luac_parser::{LuaChunk, UpVal};
 use std::cell::Cell;
 
 thread_local! {

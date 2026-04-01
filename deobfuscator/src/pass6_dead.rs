@@ -1,51 +1,43 @@
 /// Pass 6 – Dead-code elimination.
 ///
-/// Removes patterns that are provably no-ops in the output:
-///   • Empty generic-for loops  (`for … do\nend`)
-///   • Empty numeric-for loops
-///   • Empty if blocks           (`if … then\nend`)
-///   • `local _NAME = nil`
+/// Removes:
+///   • `local _NAME = nil`               (useless nil initialisation)
+///   • empty `if cond then end` blocks
+///   • empty `for … do end` loops
+///   • empty `while cond do end` loops
 
-pub fn run(src: &str) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    let mut i = 0;
+use lua_ast::{Block, Stat};
+use crate::for_each_block;
 
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut clean_block);
+}
 
-        // Empty for … do / end pair
-        if (trimmed.starts_with("for ") || trimmed.starts_with("for\t"))
-            && trimmed.ends_with("do")
-        {
-            if let Some(next) = lines.get(i + 1) {
-                if next.trim() == "end" {
-                    i += 2;
-                    continue;
-                }
+fn clean_block(block: &mut Block) {
+    lua_ast::transform_stats(block, &mut |stat| {
+        match &stat {
+            // `local _NAME = nil`
+            Stat::Local { names, values }
+                if values.len() == 1
+                    && values[0] == lua_ast::Expr::Nil
+                    && names.iter().all(|n| n.starts_with('_')) =>
+            {
+                vec![]
             }
-        }
-
-        // Empty if … then / end pair
-        if trimmed.starts_with("if ") && trimmed.ends_with("then") {
-            if let Some(next) = lines.get(i + 1) {
-                if next.trim() == "end" {
-                    i += 2;
-                    continue;
-                }
+            // Empty if block
+            Stat::If { branches, else_body }
+                if branches.iter().all(|(_, b)| b.is_empty())
+                    && else_body.as_ref().map_or(true, |b| b.is_empty()) =>
+            {
+                vec![]
             }
+            // Empty numeric for
+            Stat::NumFor { body, .. } if body.is_empty() => vec![],
+            // Empty generic for
+            Stat::GenFor { body, .. } if body.is_empty() => vec![],
+            // Empty while
+            Stat::While { body, .. } if body.is_empty() => vec![],
+            _ => vec![stat],
         }
-
-        // local _NAME = nil  (dead initialisation)
-        if trimmed.starts_with("local _") && trimmed.ends_with("= nil") {
-            i += 1;
-            continue;
-        }
-
-        out.push(line);
-        i += 1;
-    }
-
-    out.join("\n")
+    });
 }

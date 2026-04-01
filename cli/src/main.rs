@@ -291,21 +291,21 @@ fn process_file(
             }
 
             if flatten {
-                let source = decompiler::decompile_cff(&proto);
                 if deobfuscate {
-                    let clean = deobfuscator::deobfuscate(&source);
-                    return Ok(clean.into_bytes());
+                    let mut block = decompiler::decompile_cff_to_block(&proto);
+                    deobfuscator::deobfuscate(&mut block);
+                    return Ok(lua_ast::print_block(&block, 0).into_bytes());
                 }
-                return Ok(source.into_bytes());
+                return Ok(decompiler::decompile_cff(&proto).into_bytes());
             }
 
             if decompile || deobfuscate {
-                let source = decompiler::decompile(&proto);
                 if deobfuscate {
-                    let clean = deobfuscator::deobfuscate(&source);
-                    return Ok(clean.into_bytes());
+                    let mut block = decompiler::decompile_to_block(&proto);
+                    deobfuscator::deobfuscate(&mut block);
+                    return Ok(lua_ast::print_block(&block, 0).into_bytes());
                 }
-                return Ok(source.into_bytes());
+                return Ok(decompiler::decompile(&proto).into_bytes());
             }
 
             Ok(data.clone())

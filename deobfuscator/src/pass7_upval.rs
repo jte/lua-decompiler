@@ -1,8 +1,12 @@
 /// Pass 7 – Upvalue / field-access resolution.
 ///
 /// `_upvN["global"]`  →  `global`   (for known Lua standard-library names)
-/// `module["field"]`  →  `module.field`  (after the above substitution)
-use regex::Regex;
+///
+/// The printer already converts `expr["ident"]` → `expr.ident` for valid
+/// identifiers, so no extra work is needed for method-access desugaring here.
+
+use lua_ast::{Block, Expr, transform_block};
+use crate::for_each_block;
 
 const LUA_GLOBALS: &[&str] = &[
     "string", "table", "io", "os", "math", "debug", "package", "coroutine",
@@ -12,26 +16,24 @@ const LUA_GLOBALS: &[&str] = &[
     "dofile", "collectgarbage", "setmetatable", "getmetatable", "unpack",
 ];
 
-pub fn run(src: &str) -> String {
-    // Step 1: _upvN["name"] → name  (only for known globals)
-    let re_upv = Regex::new(r#"_upv\d+\["([^"]+)"\]"#).unwrap();
-    let s = re_upv.replace_all(src, |caps: &regex::Captures| {
-        let name = &caps[1];
-        if LUA_GLOBALS.contains(&name) {
-            name.to_string()
-        } else {
-            caps[0].to_string()
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut |b| {
+        transform_block(b, &mut resolve_upval);
+    });
+}
+
+fn resolve_upval(e: &mut Expr) {
+    // Pattern: _upvN["known_global"] → known_global
+    if let Expr::Index { table, key } = e {
+        if let (Expr::Name(tname), Expr::Str(kbytes)) = (table.as_ref(), key.as_ref()) {
+            if tname.starts_with("_upv") {
+                if let Ok(kstr) = std::str::from_utf8(kbytes) {
+                    if LUA_GLOBALS.contains(&kstr) {
+                        *e = Expr::Name(kstr.to_string());
+                        return;
+                    }
+                }
+            }
         }
-    });
-
-    // Step 2: known_module["field"] → known_module.field
-    // Only applies when the object is a recognised Lua standard-library name.
-    let globals_alternation = LUA_GLOBALS.join("|");
-    let pat = format!(r#"(?P<obj>{})(?:\["([a-zA-Z_]\w*)"\])"#, globals_alternation);
-    let re_field = Regex::new(&pat).unwrap();
-    let s = re_field.replace_all(&s, |caps: &regex::Captures| {
-        format!("{}.{}", &caps["obj"], caps.get(2).map_or("", |m| m.as_str()))
-    });
-
-    s.to_string()
+    }
 }

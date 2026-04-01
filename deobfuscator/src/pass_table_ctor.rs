@@ -1,132 +1,130 @@
 /// Table-constructor collapsing pass.
 ///
-/// Rewrites the common obfuscation pattern
+/// Converts:
+///   local _tN = {}
+///   _acc25 = 74            (plain integer assignments, kept for other uses)
+///   _tN[1] = _acc25        (sequential integer-keyed table population)
+///   _tN[2] = 44
+///   ...
 ///
-/// ```lua
-/// local _t359 = {}
-/// _acc25 = 74          -- plain (non-local) integer assignments
-/// _acc26 = 44
-/// ...
-/// _t359[1] = _acc25    -- sequential index population
-/// _t359[2] = _acc26
-/// _t359[9] = 81        -- may also be direct literals
-/// ```
+/// into:
+///   local _tN = {74, 44, ...}
 ///
-/// into the compact form
-///
-/// ```lua
-/// local _t359 = {74, 44, ..., 81, ...}
-/// ```
-///
-/// The plain integer-assignment lines (`_acc25 = 74`, etc.) are **kept** – they
-/// may feed other tables or be used elsewhere.  Only the `_tN[M] = EXPR` entry
-/// lines are removed.
-///
-/// A table is collapsed only when:
-///   - every entry index forms a gap-free sequence starting at 1, and
-///   - every right-hand-side value is resolvable to an integer literal
-///     (either directly or via the most-recently-seen assignment to that name).
-use regex::Regex;
+/// Only collapses when every table entry resolves to an integer literal
+/// (either directly or via the most-recently-seen assignment to that name),
+/// and the indices form a gap-free sequence starting at 1.
+
 use std::collections::HashMap;
+use lua_ast::{Block, Expr, Stat, TableField};
+use crate::for_each_block;
 
-pub fn run(src: &str) -> String {
-    let lines: Vec<&str> = src.lines().collect();
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut collapse_block);
+}
 
-    let re_decl   = Regex::new(r"^(\s*)local\s+(_t\d+)\s*=\s*\{\}\s*$").unwrap();
-    // plain assignment: _NAME = INTEGER  (no `local`, no indexing)
-    let re_int_assign = Regex::new(r"^\s*(_\w+)\s*=\s*(-?\d+)\s*$").unwrap();
-    // table entry: _tN[M] = NAME_OR_INT
-    let re_entry  = Regex::new(r"^\s*(_t\d+)\[(\d+)\]\s*=\s*(-?[\w]+)\s*$").unwrap();
-
-    // Current known integer value for each named variable.
+fn collapse_block(block: &mut Block) {
+    // Map: name → most-recently-seen integer value (for resolving variables).
     let mut val_ctx: HashMap<String, i64> = HashMap::new();
+    // Map: table_name → (decl_index, entries_so_far, entry_indices, bad_flag)
+    let mut tables: HashMap<String, TableBuild> = HashMap::new();
 
-    // Per-table build state.
-    #[derive(Default)]
-    struct Build {
-        decl_line:   usize,
-        indent:      String,
-        entries:     HashMap<usize, i64>,   // index → resolved value
-        entry_lines: Vec<usize>,            // line indices to be removed
-        bad:         bool,                  // unresolvable entry encountered
+    struct TableBuild {
+        decl_idx:     usize,
+        entries:      Vec<i64>,          // 1-based, in order
+        entry_idxs:   Vec<usize>,        // which block indices are entries
+        bad:          bool,
     }
-    let mut tables: HashMap<String, Build> = HashMap::new();
 
-    for (i, line) in lines.iter().enumerate() {
-        // Table declaration
-        if let Some(caps) = re_decl.captures(line) {
-            let tname = caps[2].to_string();
-            tables.insert(tname, Build {
-                decl_line: i,
-                indent: caps[1].to_string(),
-                ..Default::default()
-            });
-            continue;
-        }
-
-        // Plain integer assignment → update value context
-        if let Some(caps) = re_int_assign.captures(line) {
-            let name: String = caps[1].to_string();
-            let val: i64     = caps[2].parse().unwrap_or(0);
-            val_ctx.insert(name, val);
-            // (do NOT continue – may also be an entry line below, but that
-            //  pattern has `[`, so it won't match re_int_assign anyway)
-        }
-
-        // Table entry assignment
-        if let Some(caps) = re_entry.captures(line) {
-            let tname     = caps[1].to_string();
-            let idx: usize = caps[2].parse().unwrap_or(0);
-            let rhs        = &caps[3];
-
-            if let Some(build) = tables.get_mut(&tname) {
-                let value: Option<i64> = rhs.parse::<i64>().ok()
-                    .or_else(|| val_ctx.get(rhs).copied());
-
-                match value {
-                    Some(v) => { build.entries.insert(idx, v); build.entry_lines.push(i); }
-                    None    => { build.bad = true; }
+    for (i, stat) in block.iter().enumerate() {
+        match stat {
+            // Table declaration
+            Stat::Local { names, values }
+                if names.len() == 1
+                    && values.len() == 1
+                    && values[0] == Expr::Table(vec![]) =>
+            {
+                tables.insert(names[0].clone(), TableBuild {
+                    decl_idx: i,
+                    entries: Vec::new(),
+                    entry_idxs: Vec::new(),
+                    bad: false,
+                });
+            }
+            // Plain integer assignment (not to a table slot)
+            Stat::Assign { lhs, rhs }
+                if lhs.len() == 1 && rhs.len() == 1 =>
+            {
+                if let (Expr::Name(n), Expr::Integer(v)) = (&lhs[0], &rhs[0]) {
+                    val_ctx.insert(n.clone(), *v);
+                }
+                // Table-slot assignment: _tN[k] = expr
+                if let Expr::Index { table, key } = &lhs[0] {
+                    if let (Expr::Name(tname), Expr::Integer(k)) = (table.as_ref(), key.as_ref()) {
+                        let k = *k as usize;
+                        if let Some(build) = tables.get_mut(tname) {
+                            if !build.bad {
+                                let expected = build.entries.len() + 1;
+                                if k == expected {
+                                    // Resolve RHS to integer.
+                                    let val = match &rhs[0] {
+                                        Expr::Integer(v) => Some(*v),
+                                        Expr::Name(n) => val_ctx.get(n).copied(),
+                                        _ => None,
+                                    };
+                                    match val {
+                                        Some(v) => {
+                                            build.entries.push(v);
+                                            build.entry_idxs.push(i);
+                                        }
+                                        None => build.bad = true,
+                                    }
+                                } else {
+                                    build.bad = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
+            _ => {}
         }
     }
 
-    // Decide which tables to collapse
-    let mut remove:  std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut replace: HashMap<usize, String>             = HashMap::new();
+    // Apply: replace decl with constructor, remove entry statements.
+    let mut remove: Vec<usize> = Vec::new();
+    let mut replacements: Vec<(usize, Stat)> = Vec::new();
 
     for (tname, build) in &tables {
         if build.bad || build.entries.is_empty() { continue; }
-
-        let max_idx = match build.entries.keys().copied().max() { Some(m) => m, None => continue };
-        // Require gap-free 1..=max_idx
-        let values: Option<Vec<i64>> = (1..=max_idx)
-            .map(|k| build.entries.get(&k).copied())
+        let fields: Vec<TableField> = build.entries.iter()
+            .map(|&v| TableField::ValueField(Expr::Integer(v)))
             .collect();
-        let values = match values { Some(v) => v, None => continue };
-
-        let constructor = format!(
-            "{}local {} = {{{}}}",
-            build.indent,
-            tname,
-            values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
-        );
-        replace.insert(build.decl_line, constructor);
-        for &el in &build.entry_lines {
-            remove.insert(el);
-        }
+        let ctor = Stat::Local {
+            names: vec![tname.clone()],
+            values: vec![Expr::Table(fields)],
+        };
+        replacements.push((build.decl_idx, ctor));
+        remove.extend_from_slice(&build.entry_idxs);
     }
 
-    // Emit
-    lines.iter().enumerate().filter_map(|(i, line)| {
-        if remove.contains(&i) {
-            None
-        } else if let Some(replacement) = replace.get(&i) {
-            Some(replacement.clone())
-        } else {
-            Some(line.to_string())
+    if replacements.is_empty() { return; }
+
+    // Sort descending by index so we can mutate without shifting.
+    remove.sort_unstable_by(|a, b| b.cmp(a));
+    remove.dedup();
+    for i in remove { block.remove(i); }
+
+    for (orig_idx, new_stat) in replacements {
+        // After removal of entry lines, the decl index may have shifted.
+        // Find the decl by matching its old content (the empty table) or just scan.
+        // Simpler: find the Local with that tname and an empty table.
+        if let Some(pos) = block.iter().position(|s| {
+            matches!(s, Stat::Local { names, values }
+                if names.len() == 1 && matches!(&values[..], [Expr::Table(f)] if f.is_empty())
+                    && names[0] == *match &new_stat { Stat::Local { names, .. } => &names[0], _ => return false })
+        }) {
+            let _ = orig_idx;
+            block[pos] = new_stat;
         }
-    })
-    .collect::<Vec<_>>()
-    .join("\n")
+    }
 }

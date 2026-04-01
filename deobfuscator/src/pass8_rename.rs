@@ -1,79 +1,74 @@
 /// Pass 8 – Variable renaming.
 ///
-/// Renames `_accN` and `_vN` variables that were assigned a known Lua
-/// standard-library module to the module name itself (e.g. `_acc3` → `string`).
-/// Only safe because the module name is a global and the _acc variable is
-/// local – there can be no conflict after we've inlined it everywhere.
-///
-/// Also strips orphaned `local _accN = MODULE` declarations left over after
-/// substitution.
-use regex::Regex;
+/// Finds `local _NAME = MODULE` where MODULE is a known Lua standard-library
+/// name and _NAME is never reassigned.  Renames _NAME → MODULE throughout,
+/// then removes the now-trivial `local MODULE = MODULE` declarations.
+
 use std::collections::{BTreeMap, BTreeSet};
+use lua_ast::{Block, Expr, Stat};
+use crate::for_each_block;
 
 const LUA_GLOBALS: &[&str] = &[
     "string", "table", "io", "os", "math", "debug", "package", "coroutine",
     "utf8", "bit32",
 ];
 
-pub fn run(src: &str) -> String {
-    let renames = collect_module_renames(src);
-    if renames.is_empty() {
-        return src.to_string();
-    }
-    let s = apply_renames(src, &renames);
-    remove_trivial_decls(&s, &renames)
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut rename_in_block);
 }
 
-/// Find `local _NAME = MODULE` where MODULE is a known Lua global AND the
-/// variable is never subsequently reassigned.
-fn collect_module_renames(src: &str) -> BTreeMap<String, String> {
-    let globals_alt = LUA_GLOBALS.join("|");
-    let pat = format!(
-        r"(?m)^\s*local\s+(_(?:acc|v)\d+)\s*=\s*({})\s*$",
-        globals_alt
-    );
-    let re = Regex::new(&pat).unwrap();
-    let re_assign = Regex::new(r"^\s*(_[a-zA-Z]\w*)\s*=").unwrap();
+fn rename_in_block(block: &mut Block) {
+    let renames = collect_renames(block);
+    if renames.is_empty() { return; }
+    apply_renames(block, &renames);
+    // Remove `local MODULE = MODULE` that result from renaming.
+    block.retain(|s| {
+        if let Stat::Local { names, values } = s {
+            if names.len() == 1 && values.len() == 1 {
+                if let Expr::Name(rhs) = &values[0] {
+                    if names[0] == *rhs && LUA_GLOBALS.contains(&rhs.as_str()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    });
+}
 
-    let mut map = BTreeMap::new();
-    for caps in re.captures_iter(src) {
-        map.insert(caps[1].to_string(), caps[2].to_string());
+fn collect_renames(block: &Block) -> BTreeMap<String, String> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    let mut reassigned: BTreeSet<String> = BTreeSet::new();
+
+    for stat in block {
+        match stat {
+            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                let name = &names[0];
+                if let Expr::Name(module) = &values[0] {
+                    if LUA_GLOBALS.contains(&module.as_str()) && name.starts_with('_') {
+                        map.insert(name.clone(), module.clone());
+                    }
+                }
+            }
+            Stat::Assign { lhs, .. } => {
+                for e in lhs {
+                    if let Expr::Name(n) = e { reassigned.insert(n.clone()); }
+                }
+            }
+            _ => {}
+        }
     }
 
-    // Remove any name that is ever plain-reassigned (not via `local`)
-    let mut reassigned = BTreeSet::new();
-    for line in src.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("local ") {
-            continue;
-        }
-        if let Some(c) = re_assign.captures(trimmed) {
-            reassigned.insert(c[1].to_string());
-        }
-    }
     map.retain(|name, _| !reassigned.contains(name));
     map
 }
 
-fn apply_renames(src: &str, renames: &BTreeMap<String, String>) -> String {
-    let mut s = src.to_string();
-    for (old, new) in renames {
-        let re = Regex::new(&format!(r"\b{}\b", regex::escape(old))).unwrap();
-        s = re.replace_all(&s, new.as_str()).to_string();
-    }
-    s
-}
-
-/// After renaming, lines like `local string = string` are trivially redundant.
-fn remove_trivial_decls(src: &str, renames: &BTreeMap<String, String>) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    let trivial: std::collections::HashSet<String> = renames
-        .values()
-        .map(|m| format!("local {} = {}", m, m))
-        .collect();
-    lines
-        .into_iter()
-        .filter(|l| !trivial.contains(l.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn apply_renames(block: &mut Block, renames: &BTreeMap<String, String>) {
+    lua_ast::transform_block(block, &mut |e| {
+        if let Expr::Name(n) = e {
+            if let Some(new_name) = renames.get(n) {
+                *e = Expr::Name(new_name.clone());
+            }
+        }
+    });
 }

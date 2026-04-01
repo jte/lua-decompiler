@@ -1,83 +1,128 @@
-/// Pass 5 – Permutation-table resolution.
+/// Pass 5 – Permutation/lookup-table resolution.
 ///
-/// After Pass 1 + Pass 2 have folded constants, some tables are fully known:
-///
-///   local _t323 = {}
-///   _t323[1] = 27
-///   _t323[2] = 43
-///   ...
-///
-/// This pass collects such integer-only tables and substitutes `_tN[M]` with
-/// the known value wherever M is a literal integer index.
-use regex::Regex;
-use std::collections::{BTreeMap, BTreeSet};
+/// Finds `local _tN = {v1, v2, ...}` where all entries are leaf expressions
+/// (Integer, Float, Str, Name, True, False, Nil).
+/// Substitutes every `_tN[K]` reference (K integer or float-integer) with the value.
+/// Iterates to fixed-point so nested lookups like `_tN[_tN[k]]` are resolved.
 
-pub fn run(src: &str) -> String {
-    let tables = collect_integer_tables(src);
-    if tables.is_empty() {
-        return src.to_string();
-    }
-    substitute(src, &tables)
+use std::collections::BTreeMap;
+use lua_ast::{Block, Expr, Stat, TableField};
+use crate::for_each_block;
+
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut process_block);
 }
 
-/// Returns `table_name → { index → value }` for tables whose every entry is
-/// an integer literal assigned via `_tN[M] = VALUE`.
-fn collect_integer_tables(src: &str) -> BTreeMap<String, BTreeMap<usize, i64>> {
-    let re_entry = Regex::new(r"^\s*(_t\d+)\[(\d+)\]\s*=\s*(-?\d+)\s*$").unwrap();
-    let re_decl  = Regex::new(r"^\s*local\s+(_t\d+)\s*=\s*\{\}\s*$").unwrap();
-
-    // Find all locally-declared empty tables
-    let mut known: BTreeSet<String> = BTreeSet::new();
-    for line in src.lines() {
-        if let Some(c) = re_decl.captures(line) {
-            known.insert(c[1].to_string());
+fn process_block(block: &mut Block) {
+    for _ in 0..20 {
+        let tables = collect_leaf_tables(block);
+        if tables.is_empty() { return; }
+        let before = lua_ast::print_block(block, 0);
+        for (tname, entries) in &tables {
+            // Use transform_block so substitution reaches all nested blocks.
+            lua_ast::transform_block(block, &mut |node| {
+                if let Expr::Index { table, key } = node {
+                    if matches!(table.as_ref(), Expr::Name(n) if n == tname.as_str()) {
+                        if let Some(k) = key_as_usize(key.as_ref()) {
+                            // Integer index: look up positional entry.
+                            if let Some(val) = entries.get(&k) {
+                                *node = val.clone();
+                            }
+                        } else if let Expr::Str(s) = key.as_ref() {
+                            // String-numeric key: the load-loop sets tbl["N"] = N (integer).
+                            // Replace tbl["N"] with tbl[N] so the same iteration can resolve it.
+                            if let Ok(s_str) = std::str::from_utf8(s) {
+                                if let Ok(n) = s_str.parse::<i64>() {
+                                    *node = Expr::Index {
+                                        table: table.clone(),
+                                        key: Box::new(Expr::Integer(n)),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
+        if lua_ast::print_block(block, 0) == before { break; }
     }
-
-    // Collect entries
-    let mut tables: BTreeMap<String, BTreeMap<usize, i64>> = BTreeMap::new();
-    for line in src.lines() {
-        if let Some(c) = re_entry.captures(line) {
-            let tname = c[1].to_string();
-            if known.contains(&tname) {
-                let idx: usize = c[2].parse().unwrap_or(0);
-                let val: i64   = c[3].parse().unwrap_or(0);
-                tables.entry(tname).or_default().insert(idx, val);
-            }
-        }
-    }
-
-    // Filter out tables that have any non-integer entry assignment.
-    // re_entry only matched integer values, so any _tN[M] = NON_INT line taints the table.
-    let re_any_entry = Regex::new(r"^\s*(_t\d+)\[(\d+)\]\s*=\s*(.+)$").unwrap();
-    let re_int_val   = Regex::new(r"^-?\d+$").unwrap();
-    let mut tainted: BTreeSet<String> = BTreeSet::new();
-    for line in src.lines() {
-        if let Some(c) = re_any_entry.captures(line) {
-            let tname = c[1].to_string();
-            let val   = c[3].trim();
-            if !re_int_val.is_match(val) {
-                tainted.insert(tname);
-            }
-        }
-    }
-    tables.retain(|name, _| !tainted.contains(name));
-    tables
 }
 
-fn substitute(src: &str, tables: &BTreeMap<String, BTreeMap<usize, i64>>) -> String {
-    let mut s = src.to_string();
-    for (tname, entries) in tables {
-        let pat = format!(r"(?:^|(?P<pre>[^a-zA-Z0-9_])){}(?:\[(\d+)\])", regex::escape(tname));
-        let re = Regex::new(&pat).unwrap();
-        s = re.replace_all(&s, |caps: &regex::Captures| {
-            let pre = caps.name("pre").map_or("", |m| m.as_str());
-            let idx: usize = caps[2].parse().unwrap_or(0);
-            match entries.get(&idx) {
-                Some(&v) => format!("{}{}", pre, v),
-                None => caps[0].to_string(),
-            }
-        }).to_string();
+/// Extract an integer key from Integer or whole Float.
+fn key_as_usize(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Integer(n) if *n >= 1 => Some(*n as usize),
+        Expr::Float(f) if f.fract() == 0.0 && f.is_finite() && *f >= 1.0 => Some(*f as usize),
+        _ => None,
     }
-    s
+}
+
+/// True if expression is a leaf (safe to inline — no side effects, no mutable state).
+fn is_leaf(e: &Expr) -> bool {
+    matches!(e, Expr::Integer(_) | Expr::Float(_) | Expr::Str(_)
+               | Expr::Name(_) | Expr::True | Expr::False | Expr::Nil)
+}
+
+/// Returns { name → { 1-based index → expr } } for all pure-leaf tables.
+fn collect_leaf_tables(block: &Block) -> BTreeMap<String, BTreeMap<usize, Expr>> {
+    let mut result = BTreeMap::new();
+    for stat in block {
+        if let Stat::Local { names, values } = stat {
+            if names.len() == 1 && values.len() == 1 {
+                if let Some(entries) = extract_leaf_table(&values[0]) {
+                    if !entries.is_empty() {
+                        result.insert(names[0].clone(), entries);
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn extract_leaf_table(e: &Expr) -> Option<BTreeMap<usize, Expr>> {
+    if let Expr::Table(fields) = e {
+        let mut map = BTreeMap::new();
+        for (i, field) in fields.iter().enumerate() {
+            match field {
+                TableField::ValueField(v) if is_leaf(v) => {
+                    map.insert(i + 1, v.clone());
+                }
+                _ => return None, // Non-leaf entry → not a pure leaf table
+            }
+        }
+        Some(map)
+    } else {
+        None
+    }
+}
+
+fn subst_stat(stat: &mut Stat, tname: &str, entries: &BTreeMap<usize, Expr>) {
+    match stat {
+        Stat::Local { values, .. } => {
+            for v in values.iter_mut() { subst_expr(v, tname, entries); }
+        }
+        Stat::Assign { lhs, rhs } => {
+            for e in lhs.iter_mut().chain(rhs.iter_mut()) { subst_expr(e, tname, entries); }
+        }
+        Stat::Return(vals) => {
+            for v in vals.iter_mut() { subst_expr(v, tname, entries); }
+        }
+        Stat::Call(e) => subst_expr(e, tname, entries),
+        _ => {}
+    }
+}
+
+fn subst_expr(e: &mut Expr, tname: &str, entries: &BTreeMap<usize, Expr>) {
+    lua_ast::transform_expr(e, &mut |node| {
+        if let Expr::Index { table, key } = node {
+            if matches!(table.as_ref(), Expr::Name(n) if n == tname) {
+                if let Some(k) = key_as_usize(key.as_ref()) {
+                    if let Some(val) = entries.get(&k) {
+                        *node = val.clone();
+                    }
+                }
+            }
+        }
+    });
 }

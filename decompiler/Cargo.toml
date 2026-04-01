@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 utils = { path = "../utils" }
 disassembler = { path = "../disassembler" }
+lua_ast = { path = "../lua_ast" }
 petgraph = "0.6"

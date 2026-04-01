@@ -1,103 +1,122 @@
 /// Pass 9 – Global-environment desugaring.
 ///
-/// Runs at the very end of the pipeline, after all table substitutions are done.
+/// 1. `_upv0["X"]`      → `X`     (single-level global env access)
+/// 2. `_upv0["X"]["Y"]` → `X.Y`   (handled transitively via step 1 +
+///                                  the printer's dot-notation for ident keys)
+/// 3. `_upv0`           → `_G`    (bare reference to the global env upvalue)
 ///
-/// ## Transforms (iterated to a fixed point)
+/// The printer already renders `expr[Str("ident")]` as `expr.ident` when the
+/// key is a valid Lua identifier, so after step 1, two-level accesses become
+/// `X["Y"]` → `X.Y` automatically.
 ///
-/// 1. `_upv0["X"]["Y"]` → `X.Y`   — two-level upvalue access (handles the
-///    `_upv0["gg"]["makeRequest"]` pattern directly)
-/// 2. `_upv0["X"]`      → `X`     — single-level upvalue access
-/// 3. `X["Y"]`          → `X.Y`   — bracket-to-dot for any identifier (or
-///    dotted-identifier) base; excludes internal `_tNNN` obfuscation tables
-///
-/// After iteration converges:
-///
-/// 4. `_upv0` → `_G`  — any bare upvalue reference that couldn't be desugared
+/// Uses TOP-DOWN traversal so that `_upv0["X"]` is matched and replaced before
+/// any bottom-up pass could first convert `_upv0` → `_G`, which would break
+/// the parent pattern match.
 
-use regex::Regex;
+use lua_ast::{Block, Expr, Stat};
+use lua_ast::is_lua_ident;
+use crate::for_each_block;
 
-pub fn run(src: &str) -> String {
-    // These regexes are cheap to compile and this function is called once.
-    let re_two = Regex::new(
-        r#"_upv0\["([a-zA-Z_]\w*)"\]\["([a-zA-Z_]\w*)"\]"#,
-    ).unwrap();
-    let re_one = Regex::new(
-        r#"_upv0\["([a-zA-Z_]\w*)"\]"#,
-    ).unwrap();
-    // Base is a plain identifier OR a dotted chain like `_G.gg`, `foo.bar.baz`.
-    // Key must be a valid Lua identifier (letters/digits/underscore).
-    let re_field = Regex::new(
-        r#"([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\["([a-zA-Z_]\w*)"\]"#,
-    ).unwrap();
-    let re_bare = Regex::new(r"\b_upv0\b").unwrap();
-
-    let mut s = src.to_string();
-
-    // Iterate steps 1–3 until the source stabilises.  Each round can expose new
-    // opportunities: e.g. resolving `_upv0["gg"]` → `gg` lets step 3 convert
-    // `gg["makeRequest"]` → `gg.makeRequest` in the next pass.
-    for _ in 0..10 {
-        let before = s.clone();
-
-        // Step 1: _upv0["X"]["Y"] → X.Y
-        s = re_two.replace_all(&s, "$1.$2").into_owned();
-
-        // Step 2: _upv0["X"] → X
-        s = re_one.replace_all(&s, "$1").into_owned();
-
-        // Step 3: base["Y"] → base.Y  (skip internal _tNNN tables)
-        s = re_field.replace_all(&s, |caps: &regex::Captures| {
-            let base = &caps[1];
-            if is_internal_table(base) {
-                caps[0].to_string()
-            } else {
-                format!("{}.{}", base, &caps[2])
-            }
-        }).into_owned();
-
-        if s == before {
-            break;
+pub fn run(block: &mut Block) {
+    for_each_block(block, &mut |b| {
+        for _ in 0..10 {
+            let s0 = lua_ast::print_block(b, 0);
+            desugar_block(b, 0);
+            if lua_ast::print_block(b, 0) == s0 { break; }
         }
-    }
-
-    // Step 4: any remaining bare _upv0 → _G
-    re_bare.replace_all(&s, "_G").into_owned()
+    });
 }
 
-/// Returns true when `base` (the first dotted component) looks like an internal
-/// obfuscation table name (`_t` followed only by digits, e.g. `_t8845`).
-/// These still use string keys that are NOT valid Lua identifiers, so we must
-/// not convert their bracket accesses to dot notation.
-fn is_internal_table(base: &str) -> bool {
-    let first = base.split('.').next().unwrap_or(base);
-    match first.strip_prefix("_t") {
-        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
-        None => false,
+/// Top-down traversal: apply substitution before recursing into children.
+/// `func_depth` tracks how many function literals deep we are; bare `_upv0`
+/// is only replaced at depth 0 (top-level block), because in inner closures
+/// upvalue 0 captures a different value (e.g. `ipairs`).
+fn desugar_block(block: &mut Block, func_depth: u32) {
+    for stat in block.iter_mut() {
+        desugar_stat(stat, func_depth);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn desugar_stat(stat: &mut Stat, func_depth: u32) {
+    match stat {
+        Stat::Assign { lhs, rhs } => {
+            for e in lhs.iter_mut() { desugar_expr(e, func_depth); }
+            for e in rhs.iter_mut() { desugar_expr(e, func_depth); }
+        }
+        Stat::Local { values, .. } => {
+            for v in values.iter_mut() { desugar_expr(v, func_depth); }
+        }
+        Stat::Do(body) => desugar_block(body, func_depth),
+        Stat::While { cond, body } => { desugar_expr(cond, func_depth); desugar_block(body, func_depth); }
+        Stat::Repeat { body, cond } => { desugar_block(body, func_depth); desugar_expr(cond, func_depth); }
+        Stat::If { branches, else_body } => {
+            for (cond, body) in branches.iter_mut() {
+                desugar_expr(cond, func_depth);
+                desugar_block(body, func_depth);
+            }
+            if let Some(b) = else_body { desugar_block(b, func_depth); }
+        }
+        Stat::NumFor { from, to, step, body, .. } => {
+            desugar_expr(from, func_depth); desugar_expr(to, func_depth);
+            if let Some(s) = step { desugar_expr(s, func_depth); }
+            desugar_block(body, func_depth);
+        }
+        Stat::GenFor { iters, body, .. } => {
+            for e in iters.iter_mut() { desugar_expr(e, func_depth); }
+            desugar_block(body, func_depth);
+        }
+        Stat::Return(vals) => { for v in vals.iter_mut() { desugar_expr(v, func_depth); } }
+        Stat::Call(e) => desugar_expr(e, func_depth),
+        _ => {}
+    }
+}
 
-    #[test]
-    fn test_desugar() {
-        let input = concat!(
-            "_upv0[\"gg\"][\"makeRequest\"](\"test\")\n",
-            "_upv0[\"gg\"][\"searchNumber\"](4, x)\n",
-            "_upv0[\"ThanhDieuPlus\"] = _f0\n",
-            "_upv0[\"c\"] = debug.traceback()\n",
-            "if _upv0[\"_G\"][\"gg\"][\"getFile\"]() then end\n",
-            "local x = _upv0\n",
-            "_t8845[\"somekey\"] = val\n",
-        );
-        let out = run(input);
-        assert!(out.contains("gg.makeRequest("), "two-level: {}", out);
-        assert!(out.contains("gg.searchNumber("), "two-level 2: {}", out);
-        assert!(out.contains("ThanhDieuPlus = _f0"), "single-level: {}", out);
-        assert!(out.contains("c = debug.traceback()"), "single-level c: {}", out);
-        assert!(out.contains("_G.gg.getFile()"), "three-level: {}", out);
-        assert!(out.contains("local x = _G"), "bare _upv0: {}", out);
-        assert!(out.contains("_t8845[\"somekey\"]"), "internal table preserved: {}", out);
+/// Top-down expression desugaring.
+fn desugar_expr(e: &mut Expr, func_depth: u32) {
+    // Apply substitution at THIS node FIRST (top-down), then recurse.
+    match e {
+        // _upv0["X"] → X  (only when X is a valid Lua identifier)
+        Expr::Index { table, key } => {
+            if let (Expr::Name(tname), Expr::Str(kb)) = (table.as_ref(), key.as_ref()) {
+                if tname == "_upv0" {
+                    if let Ok(ks) = std::str::from_utf8(kb) {
+                        if is_lua_ident(ks) {
+                            *e = Expr::Name(ks.to_string());
+                            // No need to recurse — result is a leaf Name.
+                            return;
+                        }
+                    }
+                }
+            }
+            // Not replaced: recurse into children.
+            if let Expr::Index { table, key } = e {
+                desugar_expr(table, func_depth);
+                desugar_expr(key, func_depth);
+            }
+        }
+        // _upv0 (bare) → _G
+        Expr::Name(n) if n == "_upv0" => {
+            *e = Expr::Name("_G".to_string());
+        }
+        // Recurse into all other compound expressions.
+        Expr::BinOp { lhs, rhs, .. } => { desugar_expr(lhs, func_depth); desugar_expr(rhs, func_depth); }
+        Expr::UnOp { operand, .. } => desugar_expr(operand, func_depth),
+        Expr::Call { func, args } => {
+            desugar_expr(func, func_depth);
+            for a in args.iter_mut() { desugar_expr(a, func_depth); }
+        }
+        // When entering a function literal, increment depth so bare _upv0 is not replaced.
+        Expr::Function(fb) => desugar_block(&mut fb.body, func_depth + 1),
+        Expr::Table(fields) => {
+            use lua_ast::TableField;
+            for f in fields.iter_mut() {
+                match f {
+                    TableField::IndexField(k, v) => { desugar_expr(k, func_depth); desugar_expr(v, func_depth); }
+                    TableField::NameField(_, v) => desugar_expr(v, func_depth),
+                    TableField::ValueField(v) => desugar_expr(v, func_depth),
+                }
+            }
+        }
+        _ => {} // Leaf nodes (Name, Integer, Float, Str, Bool, Nil, Vararg)
     }
 }

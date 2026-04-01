@@ -10,3 +10,4 @@ decompiler = { path = "../decompiler" }
 disassembler = { path = "../disassembler" }
 luac-parser = { git = "https://github.com/jte/luac-parser-rs" }
 deobfuscator = { path = "../deobfuscator" }
+lua_ast = { path = "../lua_ast" }
