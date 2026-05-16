@@ -76,13 +76,20 @@ fn desugar_expr(e: &mut Expr, func_depth: u32) {
     // Apply substitution at THIS node FIRST (top-down), then recurse.
     match e {
         // _upv0["X"] → X  (only when X is a valid Lua identifier)
+        // _G["X"]    → X  (for well-known Lua standard functions accessed via _G)
         Expr::Index { table, key } => {
             if let (Expr::Name(tname), Expr::Str(kb)) = (table.as_ref(), key.as_ref()) {
                 if tname == "_upv0" {
                     if let Ok(ks) = std::str::from_utf8(kb) {
                         if is_lua_ident(ks) {
                             *e = Expr::Name(ks.to_string());
-                            // No need to recurse — result is a leaf Name.
+                            return;
+                        }
+                    }
+                } else if tname == "_G" {
+                    if let Ok(ks) = std::str::from_utf8(kb) {
+                        if is_stdlib_func(ks) {
+                            *e = Expr::Name(ks.to_string());
                             return;
                         }
                     }
@@ -119,4 +126,17 @@ fn desugar_expr(e: &mut Expr, func_depth: u32) {
         }
         _ => {} // Leaf nodes (Name, Integer, Float, Str, Bool, Nil, Vararg)
     }
+}
+
+/// True for well-known Lua standard library functions that are safe to
+/// desugar from `_G.X` to bare `X`.  Module tables (os, io, math, etc.)
+/// and special globals (load, loadfile, _G itself) are excluded so that
+/// `_G.os.remove` stays as-is rather than becoming `os.remove`.
+fn is_stdlib_func(name: &str) -> bool {
+    matches!(name,
+        "tostring" | "tonumber" | "type" | "ipairs" | "pairs" | "next" |
+        "xpcall" | "assert" | "error" | "rawget" | "rawset" |
+        "rawequal" | "rawlen" | "getmetatable" | "setmetatable" |
+        "select" | "unpack" | "collectgarbage" | "warn"
+    )
 }

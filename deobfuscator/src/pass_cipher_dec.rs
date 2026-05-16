@@ -101,6 +101,19 @@ fn process_block(block: &mut Block) {
         }
     });
 
+    // Also substitute bare TBL[EK] → decrypted (without F4 wrapper).
+    lua_ast::transform_block(block, &mut |e| {
+        if let Expr::Index { table, key } = e {
+            if let (Expr::Name(tname), Expr::Str(ek)) = (table.as_ref(), key.as_ref()) {
+                if tbl_names.contains(&tname.as_str()) {
+                    if let Some(plain) = decrypted.get(ek) {
+                        *e = Expr::Str(plain.clone());
+                    }
+                }
+            }
+        }
+    });
+
     // Step 9: Remove cipher infrastructure.
     // Build the set of indices to remove.
     let mut remove: Vec<usize> = Vec::new();
