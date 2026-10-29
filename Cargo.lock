@@ -294,7 +294,7 @@ version = "0.1.0"
 [[package]]
 name = "luac-parser"
 version = "0.5.2"
-source = "git+https://github.com/jte/luac-parser-rs#f312a7de04fc5dc93c56d84f3e2527268afd3c15"
+source = "git+https://github.com/jte/luac-parser-rs#6f4a8a5a65d785c5a76b28a8993a0f7480f94ff0"
 dependencies = [
  "bincode",
  "bitflags",

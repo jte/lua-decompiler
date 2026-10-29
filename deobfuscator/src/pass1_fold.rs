@@ -14,6 +14,11 @@ pub fn run(block: &mut Block) {
     });
 }
 
+/// Fold `e` and all its subexpressions.
+pub fn fold_tree(e: &mut Expr) {
+    lua_ast::transform_expr(e, &mut fold_expr);
+}
+
 fn fold_expr(e: &mut Expr) {
     let folded = match e {
         Expr::BinOp { op, lhs, rhs } => fold_binop(op, lhs, rhs),

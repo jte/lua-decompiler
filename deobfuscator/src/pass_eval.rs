@@ -4,7 +4,7 @@
 ///
 /// The callee is a local function declared once and never reassigned (or a
 /// function literal called on the spot), called where that declaration is in
-/// scope.  Arguments must be constants: literals, and table constructors and
+/// scope.  It may call such functions declared before it in the same block.  Arguments must be constants: literals, and table constructors and
 /// library calls built from them, so every table the call sees is its own.
 /// A small interpreter with a step limit runs the body; anything it does not
 /// model exactly — upvalues, globals other than the library functions below,
@@ -22,7 +22,7 @@ use std::rc::Rc;
 use lua_ast::{BinOp, Block, Expr, FuncBody, Stat, TableField, UnOp};
 
 use crate::for_each_block;
-use crate::pass_stdlib::{escapes, lib_untouched};
+use crate::pass_stdlib::{escapes, lib_written_fields};
 use crate::util::{assigned_names, visit_stats};
 
 const LIBS: &[(&str, &[&str])] = &[
@@ -38,7 +38,11 @@ const MAX_INT: i64 = 1 << 53;
 pub fn run(block: &mut Block) {
     if escapes(block) { return; }
     let assigned = assigned_names(block);
-    let libs: Vec<&'static str> = LIBS.iter().map(|(l, _)| *l).filter(|l| lib_untouched(block, l, &assigned)).collect();
+    // Usable library functions: the table is untouched and the field unwritten.
+    let libs: Vec<(&'static str, &'static str)> = LIBS.iter().flat_map(|(l, fs)| {
+        let written = lib_written_fields(block, l, &assigned);
+        fs.iter().filter(move |f| written.as_ref().is_some_and(|w| !w.contains(f.as_bytes()))).map(move |f| (*l, *f))
+    }).collect();
 
     let mut funcs = BTreeMap::new();
     visit_stats(block, &mut |s| if let Stat::Local { names, values } = s {
@@ -49,19 +53,24 @@ pub fn run(block: &mut Block) {
         }
     });
 
-    // Calls in the scope of each declaration.
+    // Calls in the scope of each declaration.  A function may call the
+    // qualifying functions declared before it in the same block: those names
+    // are in scope there and never change.
     for_each_block(block, &mut |b| {
+        let mut visible: HashMap<String, V> = HashMap::new();
         for i in 0..b.len() {
             let f = match &b[i] {
                 Stat::Local { names, .. } if names.len() == 1 => funcs.get(&names[0]).map(|f| (names[0].clone(), f.clone())),
                 _ => None,
             };
-            let Some((name, fb)) = f else { continue };
+            let Some((name, body)) = f else { continue };
+            let cl = Rc::new(Closure { body, upv: Rc::new(visible.clone()) });
+            visible.insert(name.clone(), V::Func(cl.clone()));
             let mut rest = b.split_off(i + 1);
             lua_ast::transform_block(&mut rest, &mut |e| {
                 if let Expr::Call { func, args } = e {
                     if matches!(func.as_ref(), Expr::Name(n) if *n == name) {
-                        if let Some(v) = call(&fb, args, &libs) { *e = v; }
+                        if let Some(v) = call(&cl, args, &libs) { *e = v; }
                     }
                 }
             });
@@ -73,24 +82,19 @@ pub fn run(block: &mut Block) {
         if let Expr::Call { func, args } = e {
             if let Expr::Function(fb) = func.as_ref() {
                 if !fb.has_vararg {
-                    if let Some(v) = call(&Rc::new((**fb).clone()), args, &libs) { *e = v; }
+                    let cl = Closure { body: Rc::new((**fb).clone()), upv: Rc::default() };
+                    if let Some(v) = call(&cl, args, &libs) { *e = v; }
                 }
             }
         }
     });
 }
 
-fn call(fb: &Rc<FuncBody>, args: &[Expr], libs: &[&'static str]) -> Option<Expr> {
-    let mut ev = Ev { steps: 0, scopes: vec![], libs };
-    ev.scopes.push(HashMap::new());
+fn call(cl: &Closure, args: &[Expr], libs: &[(&'static str, &'static str)]) -> Option<Expr> {
+    let mut ev = Ev { steps: 0, depth: 0, scopes: vec![HashMap::new()], libs };
     let vals = ev.eval_list(args).ok()?;
-    let mut frame = HashMap::new();
-    for (i, p) in fb.params.iter().enumerate() {
-        frame.insert(p.clone(), vals.get(i).cloned().unwrap_or(V::Nil));
-    }
-    ev.scopes = vec![frame];
-    match ev.exec_block(&fb.body).ok()? {
-        Flow::Return(r) if r.len() == 1 => match &r[0] {
+    match ev.invoke(cl, vals).ok()? {
+        r if r.len() == 1 => match &r[0] {
             V::Nil => Some(Expr::Nil),
             V::Bool(b) => Some(if *b { Expr::True } else { Expr::False }),
             V::Int(n) => Some(Expr::Integer(*n)),
@@ -115,6 +119,14 @@ enum V {
     Str(Rc<[u8]>),
     Tab(Rc<RefCell<HashMap<Key, V>>>),
     Lib(&'static str, &'static str),
+    Func(Rc<Closure>),
+}
+
+/// A qualifying local function and the functions it can see.
+#[derive(Debug)]
+struct Closure {
+    body: Rc<FuncBody>,
+    upv: Rc<HashMap<String, V>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -127,8 +139,10 @@ type R<T> = Result<T, ()>;
 
 struct Ev<'a> {
     steps: u32,
+    depth: u32,
     scopes: Vec<HashMap<String, V>>,
-    libs: &'a [&'static str],
+    /// Usable library functions, `(library, field)`.
+    libs: &'a [(&'static str, &'static str)],
 }
 
 fn truthy(v: &V) -> bool { !matches!(v, V::Nil | V::Bool(false)) }
@@ -178,6 +192,26 @@ impl<'a> Ev<'a> {
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
         if self.steps > STEP_LIMIT { Err(()) } else { Ok(()) }
+    }
+
+    /// Call `cl` with `args`; its body sees only its parameters, its own
+    /// locals and the functions it was declared after.
+    fn invoke(&mut self, cl: &Closure, args: Vec<V>) -> R<Vec<V>> {
+        if self.depth >= 50 { return Err(()); }
+        let mut frame = HashMap::new();
+        for (i, p) in cl.body.params.iter().enumerate() {
+            frame.insert(p.clone(), args.get(i).cloned().unwrap_or(V::Nil));
+        }
+        let saved = std::mem::replace(&mut self.scopes, vec![(*cl.upv).clone(), frame]);
+        self.depth += 1;
+        let r = self.exec_block(&cl.body.body);
+        self.depth -= 1;
+        self.scopes = saved;
+        match r? {
+            Flow::Return(v) => Ok(v),
+            Flow::Normal => Ok(vec![]),
+            Flow::Break => Err(()),
+        }
     }
 
     fn lookup(&self, n: &str) -> R<V> {
@@ -298,14 +332,18 @@ impl<'a> Ev<'a> {
     fn eval_multi(&mut self, e: &Expr) -> R<Vec<V>> {
         match e {
             Expr::Call { func, args } => {
-                let V::Lib(lib, f) = self.eval(func)? else { return Err(()) };
+                let f = self.eval(func)?;
                 let args = self.eval_list(args)?;
-                self.builtin(lib, f, &args)
+                match f {
+                    V::Lib(lib, f) => self.builtin(lib, f, &args),
+                    V::Func(cl) => self.invoke(&cl, args),
+                    _ => Err(()),
+                }
             }
             Expr::Method { obj, method, args } => {
                 let o = self.eval(obj)?;
-                if !matches!(o, V::Str(_)) || !self.libs.contains(&"string") { return Err(()); }
-                let f = LIBS[0].1.iter().find(|m| **m == method.as_str()).ok_or(())?;
+                if !matches!(o, V::Str(_)) { return Err(()); }
+                let (_, f) = *self.libs.iter().find(|(l, m)| *l == "string" && *m == method.as_str()).ok_or(())?;
                 let mut all = vec![o];
                 all.extend(self.eval_list(args)?);
                 self.builtin("string", f, &all)
@@ -328,8 +366,8 @@ impl<'a> Ev<'a> {
             Expr::Index { table, key: k } => {
                 if let (Expr::Name(lib), Expr::Str(f)) = (table.as_ref(), k.as_ref()) {
                     if self.lookup(lib).is_err() {
-                        let (l, fs) = LIBS.iter().find(|(l, _)| *l == lib.as_str() && self.libs.contains(l)).ok_or(())?;
-                        let f = fs.iter().find(|x| x.as_bytes() == f.as_slice()).ok_or(())?;
+                        let (l, f) = *self.libs.iter()
+                            .find(|(l, x)| *l == lib.as_str() && x.as_bytes() == f.as_slice()).ok_or(())?;
                         return Ok(V::Lib(l, f));
                     }
                 }
@@ -523,6 +561,7 @@ fn binop(op: &BinOp, l: &V, r: &V) -> R<V> {
                 (V::Nil, V::Nil) => true,
                 (V::Bool(a), V::Bool(b)) => a == b,
                 (V::Tab(a), V::Tab(b)) => Rc::ptr_eq(a, b),
+                (V::Func(_) | V::Lib(..), _) | (_, V::Func(_) | V::Lib(..)) => return Err(()),
                 (V::Int(_) | V::Num(_), V::Int(_) | V::Num(_)) => to_num(l)? == to_num(r)?,
                 _ => false,
             };

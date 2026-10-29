@@ -19,6 +19,7 @@ pub mod pass_fold_tables;
 pub mod pass_func_alias;
 pub mod pass_junk;
 pub mod pass_limit;
+pub mod pass_once;
 pub mod pass_stdlib;
 pub mod pass_unique;
 pub mod util;
@@ -150,6 +151,7 @@ pub fn deobfuscate(block: &mut Block) {
         pass1_fold::run(b);
         pass_stdlib::run(b);
         pass_cond::run(b);
+        pass_once::run(b);
     });
 
     // Lookup tables.
@@ -170,6 +172,7 @@ pub fn deobfuscate(block: &mut Block) {
         pass1_fold::run(b);
         pass_stdlib::run(b);
         pass_cond::run(b);
+        pass_once::run(b);
     });
 
     // Names and clean-up.

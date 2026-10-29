@@ -316,6 +316,15 @@ pub fn linearize(proto: &Proto) -> Proto {
             }
         }
 
+        // A generic-for entry jump must be followed by the loop body (the
+        // instruction after it), even though nothing falls through to it.
+        if is_forgen_entry(code, bb.end) && bb.end + 1 < code.len() {
+            let body = cfg.block_of[bb.end + 1];
+            if !relay_set.contains(&body) {
+                ft_succ = Some(body);
+            }
+        }
+
         // Push jump-side first (lower priority = processed later), then
         // fall-through last (higher priority = popped next).
         if let Some(jt) = jmp_succ {
