@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
-use disassembler::{get_opcode, getarg_b, getarg_sbx, OpCode, Proto};
+use disassembler::{get_opcode, getarg_a, getarg_b, getarg_sbx, OpCode, Proto};
 
 use crate::cfg::{BasicBlock, Cfg, EdgeKind};
 
@@ -130,16 +130,31 @@ fn is_junk_tforloop(code: &[u32], pc: usize) -> bool {
     target_i64 < 0 || (target_i64 as usize) >= code.len()
 }
 
+/// True for the JMP that enters a generic `for` (to its TFORCALL, or the 5.1
+/// TFORLOOP).  The decompiler recognises the loop by this jump sitting right
+/// before the body, so it is never treated as a relay.
+fn is_forgen_entry(code: &[u32], pc: usize) -> bool {
+    if get_opcode(code[pc]) != OpCode::Jmp {
+        return false;
+    }
+    let target = pc as i64 + 1 + getarg_sbx(code[pc]) as i64;
+    (0..code.len() as i64).contains(&target) && get_opcode(code[target as usize]) == OpCode::LuaDecTForLoop
+}
+
 /// True for *pure relay* blocks: a single-instruction block that contains
 /// either an unconditional JMP or a junk-TFORLOOP.  Both fall through to
 /// "somewhere else" with no real side effect; the block is skipped entirely
 /// (nothing emitted, not placed in the layout).
 fn is_relay(bb: &BasicBlock, code: &[u32]) -> bool {
-    if bb.start != bb.end {
+    if bb.start != bb.end || is_forgen_entry(code, bb.start) {
         return false;
     }
-    let op = get_opcode(code[bb.start]);
-    op == OpCode::Jmp || is_junk_tforloop(code, bb.start)
+    is_plain_jmp(code[bb.start]) || is_junk_tforloop(code, bb.start)
+}
+
+/// A JMP that only jumps: in Lua 5.2+ `A > 0` also closes upvalues.
+fn is_plain_jmp(instr: u32) -> bool {
+    get_opcode(instr) == OpCode::Jmp && getarg_a(instr) == 0
 }
 
 /// True for *relay-tail* blocks: the terminal instruction is an unconditional
@@ -150,8 +165,7 @@ fn is_relay(bb: &BasicBlock, code: &[u32]) -> bool {
 /// adjusted so that the natural successor follows immediately (or a synthetic
 /// JMP is inserted).
 fn has_relay_tail(bb: &BasicBlock, code: &[u32]) -> bool {
-    let last_op = get_opcode(code[bb.end]);
-    if last_op == OpCode::Jmp {
+    if is_plain_jmp(code[bb.end]) && !is_forgen_entry(code, bb.end) {
         // The JMP must NOT be preceded by a conditional-skip in the same block.
         if bb.end > bb.start && is_skip_opcode(get_opcode(code[bb.end - 1])) {
             return false;

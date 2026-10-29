@@ -26,6 +26,20 @@ fn fold_expr(e: &mut Expr) {
 }
 
 fn fold_binop(op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    if let Some(b) = fold_compare(op, lhs, rhs) {
+        return Some(if b { Expr::True } else { Expr::False });
+    }
+    // `L and R` / `L or R` with a literal `L` (R yields exactly one value).
+    if matches!(op, BinOp::And | BinOp::Or) && lhs.is_literal() {
+        let truthy = !matches!(lhs, Expr::Nil | Expr::False);
+        let take_rhs = truthy == matches!(op, BinOp::And);
+        return Some(if !take_rhs { lhs.clone() } else {
+            match rhs {
+                Expr::Call { .. } | Expr::Method { .. } | Expr::Vararg => Expr::Paren(Box::new(rhs.clone())),
+                other => other.clone(),
+            }
+        });
+    }
     // Integer × Integer
     match (lhs, rhs) {
         (Expr::Integer(a), Expr::Integer(b)) => {
@@ -115,6 +129,42 @@ fn fold_binop(op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
         _ => {}
     }
     None
+}
+
+/// Comparisons between literals.  Ordering is folded for numbers only
+/// (string order depends on the C locale).
+fn fold_compare(op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<bool> {
+    // Exact as f64 (ints beyond 2^53 are left alone).
+    let num = |e: &Expr| match e {
+        Expr::Integer(n) if n.unsigned_abs() <= 1 << 53 => Some(*n as f64),
+        Expr::Float(f) => Some(*f),
+        _ => None,
+    };
+    if !lhs.is_literal() || !rhs.is_literal() { return None; }
+    let eq = || -> Option<bool> {
+        Some(match (lhs, rhs) {
+            (Expr::Integer(a), Expr::Integer(b)) => a == b,
+            (Expr::Str(a), Expr::Str(b)) => a == b,
+            (Expr::Nil, Expr::Nil) | (Expr::True, Expr::True) | (Expr::False, Expr::False) => true,
+            _ => match (num(lhs), num(rhs)) {
+                (Some(a), Some(b)) => a == b,
+                // Different types (a huge integer against a number is unknown).
+                _ if matches!(lhs, Expr::Integer(_) | Expr::Float(_))
+                    && matches!(rhs, Expr::Integer(_) | Expr::Float(_)) => return None,
+                _ => false,
+            },
+        })
+    };
+    let (a, b) = (num(lhs), num(rhs));
+    match op {
+        BinOp::Eq => eq(),
+        BinOp::Ne => eq().map(|x| !x),
+        BinOp::Lt => Some(a? < b?),
+        BinOp::Le => Some(a? <= b?),
+        BinOp::Gt => Some(a? > b?),
+        BinOp::Ge => Some(a? >= b?),
+        _ => None,
+    }
 }
 
 fn floor_div(a: i64, b: i64) -> i64 {

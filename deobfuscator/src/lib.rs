@@ -11,12 +11,15 @@ pub mod pass6_dead;
 pub mod pass8_rename;
 pub mod pass9_desugar;
 pub mod pass_cipher_dec;
+pub mod pass_cond;
 pub mod pass_const_func;
 pub mod pass_dce;
+pub mod pass_eval;
 pub mod pass_fold_tables;
 pub mod pass_func_alias;
 pub mod pass_junk;
 pub mod pass_limit;
+pub mod pass_stdlib;
 pub mod pass_unique;
 pub mod util;
 
@@ -142,7 +145,12 @@ pub fn deobfuscate(block: &mut Block) {
     pass6_dead::run(block);
 
     // Constants.
-    fixpoint(block, &mut |b| { pass2_prop::run(b); pass1_fold::run(b); });
+    fixpoint(block, &mut |b| {
+        pass2_prop::run(b);
+        pass1_fold::run(b);
+        pass_stdlib::run(b);
+        pass_cond::run(b);
+    });
 
     // Lookup tables.
     pass3_table::run(block);
@@ -156,9 +164,12 @@ pub fn deobfuscate(block: &mut Block) {
     // Helper functions and constant tables.
     fixpoint(block, &mut |b| {
         pass_const_func::run(b);
+        pass_eval::run(b);
         pass_fold_tables::run(b);
         pass2_prop::run(b);
         pass1_fold::run(b);
+        pass_stdlib::run(b);
+        pass_cond::run(b);
     });
 
     // Names and clean-up.
