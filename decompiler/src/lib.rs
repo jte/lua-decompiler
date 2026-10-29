@@ -1079,7 +1079,15 @@ impl<'p> DecompileCtx<'p> {
             for i in 0..sub.numparams as usize {
                 sub_ctx.set_reg(i, Expr::Name(format!("_p{}", i)));
             }
+            if std::env::var("LDC_DBG_CLOSURE").is_ok() {
+                eprintln!("[closure] bx={} code_len={} first_op={:?}",
+                    bx, sub.code.len(),
+                    if sub.code.is_empty() { None } else { Some(get_opcode(sub.code[0])) });
+            }
             sub_ctx.run();
+            if std::env::var("LDC_DBG_CLOSURE").is_ok() {
+                eprintln!("[closure] bx={} -> emitted {} statements", bx, sub_ctx.output.len());
+            }
             consolidate_tables(&mut sub_ctx.output);
             let body = sub_ctx.output;
 

@@ -107,27 +107,76 @@ fn is_skip_opcode(op: OpCode) -> bool {
 
 // ── Block classification ──────────────────────────────────────────────────────
 
-/// True for *pure relay* blocks: `start == end`, single unconditional JMP.
-/// These are skipped entirely (nothing emitted, not placed in the layout).
+/// True for a TFORLOOP whose computed back-target is out of bounds.
+///
+/// Lua 5.2 semantics: `if R(A+1) ~= nil then { R(A) = R(A+1); pc += sBx }`,
+/// otherwise fall through. If `pc + 1 + sBx` is not a valid PC, then any
+/// runtime branch would crash — so either `R(A+1)` is always nil at this
+/// point (the instruction is a no-op fall-through), or this PC is unreachable.
+/// In both cases the instruction is dead weight from a control-flow standpoint
+/// and can be elided without changing semantics.
+///
+/// Used by anti-decompilation packers as an opaque-no-op at function entry
+/// (the AST builder choked on its empty `OpCode::TForLoop` arm).
+#[inline]
+fn is_junk_tforloop(code: &[u32], pc: usize) -> bool {
+    if get_opcode(code[pc]) != OpCode::TForLoop {
+        return false;
+    }
+    let sbx = getarg_sbx(code[pc]);
+    // jump_target uses i64 then casts to usize; an OOB (incl. negative)
+    // target compares false against `< code.len()`.
+    let target_i64 = pc as i64 + 1 + sbx as i64;
+    target_i64 < 0 || (target_i64 as usize) >= code.len()
+}
+
+/// True for *pure relay* blocks: a single-instruction block that contains
+/// either an unconditional JMP or a junk-TFORLOOP.  Both fall through to
+/// "somewhere else" with no real side effect; the block is skipped entirely
+/// (nothing emitted, not placed in the layout).
 fn is_relay(bb: &BasicBlock, code: &[u32]) -> bool {
-    bb.start == bb.end && get_opcode(code[bb.start]) == OpCode::Jmp
+    if bb.start != bb.end {
+        return false;
+    }
+    let op = get_opcode(code[bb.start]);
+    op == OpCode::Jmp || is_junk_tforloop(code, bb.start)
 }
 
 /// True for *relay-tail* blocks: the terminal instruction is an unconditional
-/// JMP not preceded by a conditional-skip instruction in the same block.
+/// JMP (not preceded by a conditional-skip) **or** a junk-TFORLOOP.
 ///
-/// The relay JMP is the **last** instruction; everything before it is real.
-/// During emission the JMP is omitted; the predecessor is adjusted so that
-/// the natural successor follows immediately (or a synthetic JMP is inserted).
+/// The terminal instruction is the **last** instruction; everything before
+/// it is real.  During emission the terminal is omitted; the predecessor is
+/// adjusted so that the natural successor follows immediately (or a synthetic
+/// JMP is inserted).
 fn has_relay_tail(bb: &BasicBlock, code: &[u32]) -> bool {
-    if get_opcode(code[bb.end]) != OpCode::Jmp {
-        return false;
+    let last_op = get_opcode(code[bb.end]);
+    if last_op == OpCode::Jmp {
+        // The JMP must NOT be preceded by a conditional-skip in the same block.
+        if bb.end > bb.start && is_skip_opcode(get_opcode(code[bb.end - 1])) {
+            return false;
+        }
+        return true;
     }
-    // The JMP must NOT be preceded by a conditional-skip in the same block.
-    if bb.end > bb.start && is_skip_opcode(get_opcode(code[bb.end - 1])) {
-        return false;
+    if is_junk_tforloop(code, bb.end) {
+        return true;
     }
-    true
+    false
+}
+
+/// Edge kind that carries the natural successor for a relay-tail block.
+/// - JMP-tail   → the Jump (or Back) edge target,
+/// - TFORLOOP-junk-tail → the FallThrough edge target (the TFORLOOP never
+///   branches at runtime, so removing it leaves a plain fall-through).
+#[inline]
+fn relay_tail_natural_kind(bb: &BasicBlock, code: &[u32]) -> EdgeKind {
+    if is_junk_tforloop(code, bb.end) {
+        EdgeKind::FallThrough
+    } else {
+        // Default: JMP-tail. We treat Back the same way as Jump at the call
+        // site (both are explicit branches).
+        EdgeKind::Jump
+    }
 }
 
 /// True for *padding* blocks: every instruction is a bare `RETURN R0 1`.
@@ -281,10 +330,18 @@ pub fn linearize(proto: &Proto) -> Proto {
 
             // Compute ft_real (the natural successor).
             let ft_real: Option<NodeIndex> = if is_rt {
-                // Natural successor = (removed) JMP target.
+                // Natural successor depends on what the terminal instruction is:
+                // - JMP-tail: the Jump (or Back) edge target.
+                // - junk-TFORLOOP-tail: the FallThrough edge target (the
+                //   TFORLOOP never branches at runtime).
+                let kind = relay_tail_natural_kind(bb, code);
                 cfg.graph
                     .edges(node)
-                    .filter(|e| matches!(e.weight(), EdgeKind::Jump | EdgeKind::Back))
+                    .filter(|e| match kind {
+                        EdgeKind::Jump => matches!(e.weight(), EdgeKind::Jump | EdgeKind::Back),
+                        EdgeKind::FallThrough => *e.weight() == EdgeKind::FallThrough,
+                        EdgeKind::Back => *e.weight() == EdgeKind::Back,
+                    })
                     .map(|e| follow_relay(&cfg, &relay_set, e.target()))
                     .next()
             } else {
@@ -354,9 +411,14 @@ pub fn linearize(proto: &Proto) -> Proto {
         // Synthetic trailing JMP for a non-adjacent natural successor.
         if needs_extra_jmp[i] {
             let ft_real = if is_rt {
+                let kind = relay_tail_natural_kind(bb, code);
                 cfg.graph
                     .edges(node)
-                    .filter(|e| matches!(e.weight(), EdgeKind::Jump | EdgeKind::Back))
+                    .filter(|e| match kind {
+                        EdgeKind::Jump => matches!(e.weight(), EdgeKind::Jump | EdgeKind::Back),
+                        EdgeKind::FallThrough => *e.weight() == EdgeKind::FallThrough,
+                        EdgeKind::Back => *e.weight() == EdgeKind::Back,
+                    })
                     .map(|e| follow_relay(&cfg, &relay_set, e.target()))
                     .next()
             } else {
