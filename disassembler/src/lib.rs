@@ -12,7 +12,7 @@ pub fn set_lua_version(v: u8) {
     LUA_VERSION.with(|c| c.set(v));
 }
 
-fn lua_version() -> u8 {
+pub fn lua_version() -> u8 {
     LUA_VERSION.with(|c| c.get())
 }
 
@@ -200,6 +200,8 @@ fn lua52_opcode(op: u32) -> OpCode {
     }
 }
 
+/// Opcode numbering of stock Lua 5.3 (lopcodes.h), which renumbers everything
+/// after SELF relative to 5.2.
 fn lua53_opcode(op: u32) -> OpCode {
     match op {
         0  => OpCode::Move,
@@ -218,37 +220,37 @@ fn lua53_opcode(op: u32) -> OpCode {
         13 => OpCode::Add,
         14 => OpCode::Sub,
         15 => OpCode::Mul,
-        16 => OpCode::Div,
-        17 => OpCode::Mod,
-        18 => OpCode::Pow,
-        19 => OpCode::Unm,
-        20 => OpCode::Not,
-        21 => OpCode::Len,
-        22 => OpCode::Concat,
-        23 => OpCode::Jmp,
-        24 => OpCode::Eq,
-        25 => OpCode::Lt,
-        26 => OpCode::Le,
-        27 => OpCode::Test,
-        28 => OpCode::TestSet,
-        29 => OpCode::Call,
-        30 => OpCode::TailCall,
-        31 => OpCode::Return,
-        32 => OpCode::ForLoop,
-        33 => OpCode::ForPrep,
-        34 => OpCode::LuaDecTForLoop,
-        35 => OpCode::TForLoop,
-        36 => OpCode::SetList,
-        37 => OpCode::Closure,
-        38 => OpCode::VarArg,
-        39 => OpCode::ExtraArg,
-        40 => OpCode::IDiv,
-        41 => OpCode::BNot,
-        42 => OpCode::Band,
-        43 => OpCode::Bor,
-        44 => OpCode::BXor,
-        45 => OpCode::Shl,
-        46 => OpCode::Shr,
+        16 => OpCode::Mod,
+        17 => OpCode::Pow,
+        18 => OpCode::Div,
+        19 => OpCode::IDiv,
+        20 => OpCode::Band,
+        21 => OpCode::Bor,
+        22 => OpCode::BXor,
+        23 => OpCode::Shl,
+        24 => OpCode::Shr,
+        25 => OpCode::Unm,
+        26 => OpCode::BNot,
+        27 => OpCode::Not,
+        28 => OpCode::Len,
+        29 => OpCode::Concat,
+        30 => OpCode::Jmp,
+        31 => OpCode::Eq,
+        32 => OpCode::Lt,
+        33 => OpCode::Le,
+        34 => OpCode::Test,
+        35 => OpCode::TestSet,
+        36 => OpCode::Call,
+        37 => OpCode::TailCall,
+        38 => OpCode::Return,
+        39 => OpCode::ForLoop,
+        40 => OpCode::ForPrep,
+        41 => OpCode::LuaDecTForLoop,
+        42 => OpCode::TForLoop,
+        43 => OpCode::SetList,
+        44 => OpCode::Closure,
+        45 => OpCode::VarArg,
+        46 => OpCode::ExtraArg,
         _  => OpCode::Unknown,
     }
 }
@@ -300,8 +302,19 @@ pub struct UpvalDesc {
     pub idx: u8,
 }
 
+/// A local variable from the debug info: `name` lives in its register for
+/// pcs `start_pc..end_pc`.
+#[derive(Clone, Debug)]
+pub struct LocVar {
+    pub name: String,
+    pub start_pc: usize,
+    pub end_pc: usize,
+}
+
 #[derive(Clone)]
 pub struct Proto {
+    /// Lua version byte from the chunk header (0x51, 0x52, 0x53).
+    pub version: u8,
     pub linedefined: u64,
     pub numparams: u8,
     pub is_vararg: u8,
@@ -314,6 +327,8 @@ pub struct Proto {
     pub upvalue_names: Vec<String>,
     pub upvalue_infos: Vec<UpvalDesc>,
     pub num_upvalues: u8,
+    /// Debug-info locals (empty for stripped chunks).
+    pub locals: Vec<LocVar>,
 }
 
 impl From<LuaChunk> for Proto {
@@ -332,21 +347,30 @@ impl From<LuaChunk> for Proto {
             .map(|u: UpVal| UpvalDesc { on_stack: u.on_stack, idx: u.id })
             .collect();
         let p = chunk.prototypes.into_iter().map(Proto::from).collect();
+        let version = lua_version();
         // Some Lua 5.2 variants set number_integral to a non-zero value but still
         // store numbers as IEEE 754 doubles (the raw 8 bytes are a double bit pattern
         // reinterpreted as an integer).  Re-interpret any Integer constant whose bit
         // pattern produces a normal (non-subnormal, non-NaN) f64 as a Float constant.
+        // Lua 5.3 has real integer constants, so leave those alone.
         let constants = chunk.constants.into_iter().map(|c| {
             if let LuaConstant::Number(LuaNumber::Integer(v)) = c {
                 let f = f64::from_bits(v as u64);
-                if f.is_finite() && !f.is_subnormal() {
+                if version < 0x53 && f.is_finite() && !f.is_subnormal() {
                     return LuaConstant::Number(LuaNumber::Float(f));
                 }
                 return LuaConstant::Number(LuaNumber::Integer(v));
             }
             c
         }).collect();
+        let locals = chunk.locals.into_iter().map(|l| LocVar {
+            name: l.name,
+            start_pc: l.start_pc as usize,
+            end_pc: l.end_pc as usize,
+        }).collect();
         Proto {
+            version,
+            locals,
             linedefined: chunk.line_defined,
             numparams: chunk.num_params,
             is_vararg: chunk.is_vararg.is_some() as u8,

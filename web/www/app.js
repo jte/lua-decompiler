@@ -1,6 +1,6 @@
 const TIMEOUT_MS = 60_000;
 // Above this size, skip syntax highlighting — building that much DOM is slow.
-const HIGHLIGHT_LIMIT = 1_500_000;
+const HIGHLIGHT_LIMIT = 200_000;
 
 const $ = (sel) => document.querySelector(sel);
 const meta = (name) => document.querySelector(`meta[name="${name}"]`)?.content.trim() ?? "";

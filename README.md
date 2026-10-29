@@ -8,9 +8,15 @@ entirely in your browser via WebAssembly; files are never uploaded.
 
 ## Features
 
-- Decompiles Lua **5.1, 5.2 and 5.3** bytecode (`luac` output) back to source
-- **Deobfuscation** passes: constant folding, string and cipher decryption,
-  table and alias inlining, dead-code removal, local renaming
+- Decompiles Lua **5.1, 5.2 and 5.3** bytecode (`luac` output) back to source:
+  loops, `if`/`elseif`, `and`/`or` expressions, method calls, table
+  constructors, closures; local names come from debug info when present
+- Output is meant to behave exactly like the bytecode; unstructurable
+  (irreducible) control flow falls back to `goto`
+- **Deobfuscation** passes that only rewrite what they can prove equivalent:
+  noise removal, constant folding and propagation, lookup-table resolution,
+  XOR-cipher string decryption, constant/identity function inlining,
+  dead-code removal, naming of re-bound API functions
 - **Control-flow unflattening** for JMP-spaghetti obfuscators
 - Recovers Lua 5.2 files whose debug info was corrupted by obfuscators
 - Bytecode disassembler, control-flow-graph export (Graphviz DOT) and an

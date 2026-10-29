@@ -8,20 +8,19 @@ pub mod pass3_table;
 pub mod pass4_concat;
 pub mod pass5_perm;
 pub mod pass6_dead;
-pub mod pass7_upval;
 pub mod pass8_rename;
-pub mod pass_table_ctor;
-pub mod pass_strdec;
-pub mod pass_stream_dec;
-pub mod pass_const_func;
-pub mod pass_fold_tables;
-pub mod pass_inline_locals;
-pub mod pass_subtable_decode;
 pub mod pass9_desugar;
 pub mod pass_cipher_dec;
+pub mod pass_const_func;
+pub mod pass_dce;
+pub mod pass_fold_tables;
 pub mod pass_func_alias;
+pub mod pass_junk;
+pub mod pass_limit;
+pub mod pass_unique;
+pub mod util;
 
-use lua_ast::{Block, Expr, FuncBody, Stat};
+use lua_ast::{Block, Expr, Stat};
 
 // ---------------------------------------------------------------------------
 // Shared recursive utility
@@ -68,7 +67,7 @@ fn visit_stat_blocks(stat: &mut Stat, f: &mut impl FnMut(&mut Block)) {
 fn visit_expr_func_bodies(expr: &mut Expr, f: &mut impl FnMut(&mut Block)) {
     match expr {
         Expr::Function(fb) => for_each_block(&mut fb.body, f),
-        Expr::Call { func, args } => {
+        Expr::Call { func, args } | Expr::Method { obj: func, args, .. } => {
             visit_expr_func_bodies(func, f);
             for a in args { visit_expr_func_bodies(a, f); }
         }
@@ -97,53 +96,78 @@ fn visit_expr_func_bodies(expr: &mut Expr, f: &mut impl FnMut(&mut Block)) {
     }
 }
 
+/// Pre-order walk over an expression.  Function literals are visited but not
+/// entered (callers decide whether to look at their bodies).
+pub fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Index { table, key } => { walk_expr(table, f); walk_expr(key, f); }
+        Expr::Call { func, args } | Expr::Method { obj: func, args, .. } => { walk_expr(func, f); for a in args { walk_expr(a, f); } }
+        Expr::BinOp { lhs, rhs, .. } => { walk_expr(lhs, f); walk_expr(rhs, f); }
+        Expr::UnOp { operand, .. } | Expr::Paren(operand) => walk_expr(operand, f),
+        Expr::Table(fields) => {
+            for fl in fields {
+                match fl {
+                    lua_ast::TableField::IndexField(k, v) => { walk_expr(k, f); walk_expr(v, f); }
+                    lua_ast::TableField::NameField(_, v) | lua_ast::TableField::ValueField(v) => walk_expr(v, f),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Run all deobfuscation passes on `block` in place.
+///
+/// Every pass only rewrites what it can prove equivalent (see
+/// [`util`] for the shared checks), so the result behaves like the input.
 pub fn deobfuscate(block: &mut Block) {
-    // Phase A: name/structure cleanup
-    pass7_upval::run(block);
+    let fixpoint = |block: &mut Block, f: &mut dyn FnMut(&mut Block)| {
+        for _ in 0..8 {
+            let s0 = lua_ast::print_block(block, 0);
+            f(block);
+            if lua_ast::print_block(block, 0) == s0 { break; }
+        }
+    };
+
+    // One name per variable, so the name-based checks below are exact.
+    pass_unique::run(block);
+
+    // Obfuscator noise and trivially dead code.
+    pass_junk::run(block);
     pass6_dead::run(block);
 
-    // Phase B: constant simplification (iterate to fixed point)
-    for _ in 0..8 {
-        let s0 = lua_ast::print_block(block, 0);
-        pass2_prop::run(block);
-        pass1_fold::run(block);
-        if lua_ast::print_block(block, 0) == s0 { break; }
-    }
+    // Constants.
+    fixpoint(block, &mut |b| { pass2_prop::run(b); pass1_fold::run(b); });
 
-    // Phase C: table-based obfuscation
+    // Lookup tables.
     pass3_table::run(block);
-    pass_table_ctor::run(block);
     pass5_perm::run(block);
-
-    // Fold again after table substitution
-    for _ in 0..8 {
-        let s0 = lua_ast::print_block(block, 0);
-        pass1_fold::run(block);
-        if lua_ast::print_block(block, 0) == s0 { break; }
-    }
-
-    // Phase D: string reconstruction
-    pass_strdec::run(block);
-    pass_stream_dec::run(block);
+    pass1_fold::run(block);
     pass4_concat::run(block);
 
-    // Phase E: final cleanup
-    pass_inline_locals::run(block);
-    pass_subtable_decode::run(block);
-    pass9_desugar::run(block);  // desugar _upv0.X → X so _acc15 entries become leaf exprs
-    pass5_perm::run(block);     // resolve mixed-type lookup tables (e.g. _acc15) after decode
-    pass1_fold::run(block);     // fold any new constants exposed by table substitution
-    pass_cipher_dec::run(block); // decrypt XOR cipher wrapper functions
-    pass_const_func::run(block);
-    pass_fold_tables::run(block);
-    pass_const_func::run(block);  // second pass after fold — resolves _acc16[key] from constructors
-    pass_func_alias::run(block);  // resolve gg.X = _fN → substitute _fN → gg.X everywhere
+    // Encrypted strings.
+    pass_cipher_dec::run(block);
+
+    // Helper functions and constant tables.
+    fixpoint(block, &mut |b| {
+        pass_const_func::run(b);
+        pass_fold_tables::run(b);
+        pass2_prop::run(b);
+        pass1_fold::run(b);
+    });
+
+    // Names and clean-up.
+    pass_func_alias::run(block);
+    pass_dce::run(block);
     pass6_dead::run(block);
     pass8_rename::run(block);
     pass9_desugar::run(block);
+
+    // Lua's 200-locals limit, now that unused locals are gone.
+    pass_limit::run(block);
 }

@@ -450,18 +450,13 @@ pub fn linearize(proto: &Proto) -> Proto {
         .collect();
 
     Proto {
-        linedefined:   proto.linedefined,
-        numparams:     proto.numparams,
-        is_vararg:     proto.is_vararg,
-        maxstacksize:  proto.maxstacksize,
         sizecode:      new_code.len(),
         code:          new_code,
         sizep:         new_p.len(),
         p:             new_p,
-        constants:     proto.constants.clone(),
-        upvalue_names: proto.upvalue_names.clone(),
-        upvalue_infos: proto.upvalue_infos.clone(),
-        num_upvalues:  proto.num_upvalues,
+        // Debug locals refer to the old pcs.
+        locals:        Vec::new(),
+        ..proto.clone()
     }
 }
 

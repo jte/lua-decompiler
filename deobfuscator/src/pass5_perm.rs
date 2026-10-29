@@ -15,11 +15,19 @@ pub fn run(block: &mut Block) {
 
 fn process_block(block: &mut Block) {
     for _ in 0..20 {
-        let tables = collect_leaf_tables(block);
+        let load_eval = find_load_eval_tables(block);
+        let mut tables = collect_leaf_tables(block);
+        // Only tables that are provably never modified can be resolved
+        // statically, and only with entries whose value cannot change.
+        let assigned = assigned_names(block);
+        tables.retain(|tname, entries| {
+            read_only(block, tname, load_eval.contains(tname.as_str()))
+                && entries.values().all(|v| !matches!(v, Expr::Name(n) if assigned.contains(n) || n == tname))
+        });
         if tables.is_empty() { return; }
         let before = lua_ast::print_block(block, 0);
         for (tname, entries) in &tables {
-            let mut subst_count = 0usize;
+            let is_load_eval = load_eval.contains(tname.as_str());
             // Use transform_block so substitution reaches all nested blocks.
             lua_ast::transform_block(block, &mut |node| {
                 if let Expr::Index { table, key } = node {
@@ -30,8 +38,9 @@ fn process_block(block: &mut Block) {
                                 *node = val.clone();
                             }
                         } else if let Expr::Str(s) = key.as_ref() {
-                            // String-numeric key: the load-loop sets tbl["N"] = N (integer).
-                            // Replace tbl["N"] with tbl[N] so the same iteration can resolve it.
+                            // The load loop turns tbl["N"] into the value of entry N,
+                            // so for those tables tbl["N"] reads entry N.
+                            if !is_load_eval { return; }
                             if let Ok(s_str) = std::str::from_utf8(s) {
                                 if let Ok(n) = s_str.parse::<i64>() {
                                     *node = Expr::Index {
@@ -47,6 +56,135 @@ fn process_block(block: &mut Block) {
         }
         if lua_ast::print_block(block, 0) == before { break; }
     }
+}
+
+/// Names that are assignment targets anywhere (including nested functions),
+/// plus every local declared more than once.
+fn assigned_names(block: &Block) -> BTreeSet<String> {
+    fn stat(s: &Stat, out: &mut BTreeSet<String>, decls: &mut BTreeMap<String, usize>) {
+        match s {
+            Stat::Assign { lhs, rhs } => {
+                for l in lhs { if let Expr::Name(n) = l { out.insert(n.clone()); } }
+                for e in lhs.iter().chain(rhs) { expr(e, out, decls); }
+            }
+            Stat::Local { names, values } => {
+                for n in names { *decls.entry(n.clone()).or_default() += 1; }
+                for e in values { expr(e, out, decls); }
+            }
+            Stat::NumFor { var, from, to, step, body } => {
+                *decls.entry(var.clone()).or_default() += 1;
+                for e in [Some(from), Some(to), step.as_ref()].into_iter().flatten() { expr(e, out, decls); }
+                for s in body { stat(s, out, decls); }
+            }
+            Stat::GenFor { vars, iters, body } => {
+                for v in vars { *decls.entry(v.clone()).or_default() += 1; }
+                for e in iters { expr(e, out, decls); }
+                for s in body { stat(s, out, decls); }
+            }
+            Stat::While { cond, body } | Stat::Repeat { body, cond } => {
+                expr(cond, out, decls);
+                for s in body { stat(s, out, decls); }
+            }
+            Stat::If { branches, else_body } => {
+                for (c, b) in branches { expr(c, out, decls); for s in b { stat(s, out, decls); } }
+                if let Some(b) = else_body { for s in b { stat(s, out, decls); } }
+            }
+            Stat::Do(b) => { for s in b { stat(s, out, decls); } }
+            Stat::Return(v) => { for e in v { expr(e, out, decls); } }
+            Stat::Call(e) => expr(e, out, decls),
+            _ => {}
+        }
+    }
+    fn expr(e: &Expr, out: &mut BTreeSet<String>, decls: &mut BTreeMap<String, usize>) {
+        crate::walk_expr(e, &mut |x| {
+            if let Expr::Function(fb) = x {
+                for p in &fb.params { *decls.entry(p.clone()).or_default() += 1; }
+                for s in &fb.body { stat(s, out, decls); }
+            }
+        });
+    }
+    let mut out = BTreeSet::new();
+    let mut decls = BTreeMap::new();
+    for s in block { stat(s, &mut out, &mut decls); }
+    out.extend(decls.into_iter().filter(|(_, c)| *c > 1).map(|(n, _)| n));
+    out
+}
+
+/// Is `tname` only ever read as `tname[...]` (never assigned, written,
+/// passed around or captured as a value)?  For load-eval tables the decoding
+/// loop's `pairs(t)` / `t[k] = load(...)()` are allowed too.
+fn read_only(block: &Block, tname: &str, load_eval: bool) -> bool {
+    fn ok_expr(e: &Expr, t: &str, le: bool) -> bool {
+        match e {
+            Expr::Name(n) => n != t,
+            Expr::Index { table, key } => {
+                let base_ok = matches!(table.as_ref(), Expr::Name(n) if n == t) || ok_expr(table, t, le);
+                base_ok && ok_expr(key, t, le)
+            }
+            Expr::Call { func, args } => {
+                // pairs(t) inside the load-eval loop.
+                if le && args.len() == 1 && matches!(&args[0], Expr::Name(n) if n == t)
+                    && matches!(func.as_ref(), Expr::Name(f) if f == "pairs" || f == "ipairs")
+                {
+                    return true;
+                }
+                ok_expr(func, t, le) && args.iter().all(|a| ok_expr(a, t, le))
+            }
+            Expr::BinOp { lhs, rhs, .. } => ok_expr(lhs, t, le) && ok_expr(rhs, t, le),
+            Expr::UnOp { operand, .. } | Expr::Paren(operand) => ok_expr(operand, t, le),
+            Expr::Table(fields) => fields.iter().all(|f| match f {
+                TableField::IndexField(k, v) => ok_expr(k, t, le) && ok_expr(v, t, le),
+                TableField::NameField(_, v) | TableField::ValueField(v) => ok_expr(v, t, le),
+            }),
+            Expr::Function(fb) => fb.body.iter().all(|s| ok_stat(s, t, le)),
+            _ => true,
+        }
+    }
+    fn ok_stat(s: &Stat, t: &str, le: bool) -> bool {
+        match s {
+            Stat::Assign { lhs, rhs } => {
+                lhs.iter().all(|l| match l {
+                    Expr::Name(n) => n != t,
+                    Expr::Index { table, key } if matches!(table.as_ref(), Expr::Name(n) if n == t) => {
+                        le && ok_expr(key, t, le)
+                    }
+                    other => ok_expr(other, t, le),
+                }) && rhs.iter().all(|e| ok_expr(e, t, le))
+            }
+            Stat::Local { values, .. } => values.iter().all(|e| ok_expr(e, t, le)),
+            Stat::While { cond, body } | Stat::Repeat { body, cond } => {
+                ok_expr(cond, t, le) && body.iter().all(|s| ok_stat(s, t, le))
+            }
+            Stat::If { branches, else_body } => {
+                branches.iter().all(|(c, b)| ok_expr(c, t, le) && b.iter().all(|s| ok_stat(s, t, le)))
+                    && else_body.as_ref().map_or(true, |b| b.iter().all(|s| ok_stat(s, t, le)))
+            }
+            Stat::NumFor { from, to, step, body, .. } => {
+                ok_expr(from, t, le) && ok_expr(to, t, le)
+                    && step.as_ref().map_or(true, |s| ok_expr(s, t, le))
+                    && body.iter().all(|s| ok_stat(s, t, le))
+            }
+            Stat::GenFor { iters, body, .. } => {
+                iters.iter().all(|e| ok_expr(e, t, le)) && body.iter().all(|s| ok_stat(s, t, le))
+            }
+            Stat::Do(b) => b.iter().all(|s| ok_stat(s, t, le)),
+            Stat::Return(v) => v.iter().all(|e| ok_expr(e, t, le)),
+            Stat::Call(e) => ok_expr(e, t, le),
+            _ => true,
+        }
+    }
+    let mut decls = 0;
+    for s in block {
+        if let Stat::Local { names, values } = s {
+            if names.iter().any(|n| n == tname) {
+                decls += 1;
+                if !values.iter().all(|e| ok_expr(e, tname, load_eval)) { return false; }
+                continue;
+            }
+        }
+        if !ok_stat(s, tname, load_eval) { return false; }
+    }
+    decls == 1
 }
 
 /// Extract an integer key from Integer or whole Float.

@@ -1,12 +1,13 @@
-/// Pass 8 – Variable renaming.
+/// Pass 8 – Standard-library alias removal.
 ///
-/// Finds `local _NAME = MODULE` where MODULE is a known Lua standard-library
-/// name and _NAME is never reassigned.  Renames _NAME → MODULE throughout,
-/// then removes the now-trivial `local MODULE = MODULE` declarations.
+/// `local _x = string` (a generated name bound to a library table), where
+/// neither `_x` nor `string` is ever reassigned or redeclared anywhere, is
+/// removed and `_x` replaced by `string` throughout.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use lua_ast::{Block, Expr, Stat};
-use crate::for_each_block;
+
+use crate::util::{assigned_names, count_refs};
 
 const LUA_GLOBALS: &[&str] = &[
     "string", "table", "io", "os", "math", "debug", "package", "coroutine",
@@ -14,61 +15,56 @@ const LUA_GLOBALS: &[&str] = &[
 ];
 
 pub fn run(block: &mut Block) {
-    for_each_block(block, &mut rename_in_block);
+    let assigned = assigned_names(block);
+    let mut renames: BTreeMap<String, String> = BTreeMap::new();
+    collect(block, &assigned, &mut renames);
+    // The library name must not be declared as a local anywhere.
+    renames.retain(|_, module| !is_declared(block, module));
+    if renames.is_empty() { return; }
+    lua_ast::transform_block(block, &mut |e| {
+        if let Expr::Name(n) = e {
+            if let Some(m) = renames.get(n) { *n = m.clone(); }
+        }
+    });
+    remove_self_aliases(block);
 }
 
-fn rename_in_block(block: &mut Block) {
-    let renames = collect_renames(block);
-    if renames.is_empty() { return; }
-    apply_renames(block, &renames);
-    // Remove `local MODULE = MODULE` that result from renaming.
-    block.retain(|s| {
+fn collect(block: &Block, assigned: &std::collections::BTreeSet<String>, out: &mut BTreeMap<String, String>) {
+    crate::util::visit_stats(block, &mut |s| {
         if let Stat::Local { names, values } = s {
             if names.len() == 1 && values.len() == 1 {
-                if let Expr::Name(rhs) = &values[0] {
-                    if names[0] == *rhs && LUA_GLOBALS.contains(&rhs.as_str()) {
-                        return false;
+                if let Expr::Name(module) = &values[0] {
+                    let name = &names[0];
+                    if LUA_GLOBALS.contains(&module.as_str()) && name.starts_with('_')
+                        && !assigned.contains(name) && !assigned.contains(module)
+                    {
+                        out.insert(name.clone(), module.clone());
                     }
                 }
             }
         }
-        true
     });
 }
 
-fn collect_renames(block: &Block) -> BTreeMap<String, String> {
-    let mut map: BTreeMap<String, String> = BTreeMap::new();
-    let mut reassigned: BTreeSet<String> = BTreeSet::new();
-
-    for stat in block {
-        match stat {
-            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 => {
-                let name = &names[0];
-                if let Expr::Name(module) = &values[0] {
-                    if LUA_GLOBALS.contains(&module.as_str()) && name.starts_with('_') {
-                        map.insert(name.clone(), module.clone());
-                    }
-                }
-            }
-            Stat::Assign { lhs, .. } => {
-                for e in lhs {
-                    if let Expr::Name(n) = e { reassigned.insert(n.clone()); }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    map.retain(|name, _| !reassigned.contains(name));
-    map
+fn is_declared(block: &Block, name: &str) -> bool {
+    // count_refs counts declarations and uses; uses of the global are fine,
+    // so look for declarations specifically.
+    let mut found = false;
+    crate::util::visit_stats(block, &mut |s| match s {
+        Stat::Local { names, .. } => { if names.iter().any(|n| n == name) { found = true; } }
+        Stat::NumFor { var, .. } => { if var == name { found = true; } }
+        Stat::GenFor { vars, .. } => { if vars.iter().any(|n| n == name) { found = true; } }
+        _ => {}
+    });
+    let _ = count_refs;
+    found
 }
 
-fn apply_renames(block: &mut Block, renames: &BTreeMap<String, String>) {
-    lua_ast::transform_block(block, &mut |e| {
-        if let Expr::Name(n) = e {
-            if let Some(new_name) = renames.get(n) {
-                *e = Expr::Name(new_name.clone());
-            }
-        }
+/// Drop the `local string = string` declarations left by the renaming.
+fn remove_self_aliases(block: &mut Block) {
+    lua_ast::transform_stats(block, &mut |s| match &s {
+        Stat::Local { names, values } if names.len() == 1 && values.len() == 1
+            && matches!(&values[0], Expr::Name(m) if *m == names[0] && LUA_GLOBALS.contains(&m.as_str())) => vec![],
+        _ => vec![s],
     });
 }

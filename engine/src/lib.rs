@@ -49,10 +49,13 @@ pub fn run(proto: &Proto, mode: Mode, flatten: bool) -> String {
         Mode::Decompile if flatten => decompiler::decompile_cff(proto),
         Mode::Decompile => decompiler::decompile(proto),
         Mode::Deobfuscate => {
+            // One name per variable for the deobfuscator; it applies the
+            // locals limit itself at the end.
+            let opts = decompiler::Options { reuse_locals: false };
             let mut block = if flatten {
-                decompiler::decompile_cff_to_block(proto)
+                decompiler::decompile_cff_to_block_with(proto, opts)
             } else {
-                decompiler::decompile_to_block(proto)
+                decompiler::decompile_to_block_with(proto, opts)
             };
             deobfuscator::deobfuscate(&mut block);
             lua_ast::print_block(&block, 0)

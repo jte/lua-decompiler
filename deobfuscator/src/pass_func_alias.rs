@@ -1,194 +1,88 @@
-/// Pass – Global function alias resolution.
+/// Pass – name local functions after the API slot they are installed into.
 ///
-/// Finds assignments of the form:
-///   `CHAIN = _fN`
-/// where CHAIN is a pure index chain (e.g. `gg.searchNumber`),
-/// and _fN is a local function name.
-///
-/// Then substitutes every `_fN` name occurrence with `CHAIN` throughout the
-/// whole AST, EXCEPT in the assignment itself (`CHAIN = _fN` is preserved).
+/// For `gg.searchNumber = _f3` (an obfuscator re-binding an API), the local
+/// `_f3` is renamed to `gg_searchNumber` everywhere.  Renaming never changes
+/// behaviour, unlike substituting `gg.searchNumber` for `_f3`, which would
+/// only be right while that field still holds the function.
 
 use std::collections::BTreeMap;
-use lua_ast::{Block, Expr, Stat, TableField};
+use lua_ast::{Block, Expr, Stat};
+
+use crate::util::{assigned_names, count_refs, visit_stats};
 
 pub fn run(block: &mut Block) {
-    let mut mapping: BTreeMap<String, Expr> = BTreeMap::new();
-    collect_block(block, &mut mapping);
-    if mapping.is_empty() { return; }
-    apply_block(block, &mapping);
-}
-
-// ---------------------------------------------------------------------------
-// Collection: find CHAIN = _fN assignments recursively
-// ---------------------------------------------------------------------------
-
-fn collect_block(block: &Block, mapping: &mut BTreeMap<String, Expr>) {
-    for stat in block.iter() {
-        match stat {
-            Stat::Assign { lhs, rhs } if lhs.len() == 1 && rhs.len() == 1 => {
-                if !matches!(&lhs[0], Expr::Name(_)) && is_pure_index_chain(&lhs[0]) {
-                    if let Expr::Name(fn_name) = &rhs[0] {
-                        mapping.entry(fn_name.clone()).or_insert_with(|| lhs[0].clone());
+    let assigned = assigned_names(block);
+    let mut renames: BTreeMap<String, String> = BTreeMap::new();
+    let mut taken: Vec<String> = Vec::new();
+    visit_stats(block, &mut |s| {
+        if let Stat::Assign { lhs, rhs } = s {
+            if lhs.len() == 1 && rhs.len() == 1 && !matches!(lhs[0], Expr::Name(_)) {
+                if let (Some(path), Expr::Name(f)) = (chain_name(&lhs[0]), &rhs[0]) {
+                    // Only generated names, declared once and never reassigned.
+                    if f.starts_with('_') && !assigned.contains(f) && !renames.contains_key(f) && !taken.contains(&path) {
+                        taken.push(path.clone());
+                        renames.insert(f.clone(), path);
                     }
                 }
-                collect_expr(&rhs[0], mapping);
             }
-            Stat::Local { values, .. } => {
-                for v in values { collect_expr(v, mapping); }
-            }
-            Stat::Return(vals) => {
-                for v in vals { collect_expr(v, mapping); }
-            }
-            Stat::Call(e) => collect_expr(e, mapping),
-            Stat::Do(b) => collect_block(b, mapping),
-            Stat::While { body, .. } => collect_block(body, mapping),
-            Stat::Repeat { body, .. } => collect_block(body, mapping),
-            Stat::NumFor { body, .. } => collect_block(body, mapping),
-            Stat::GenFor { body, .. } => collect_block(body, mapping),
+        }
+    });
+    // The function must be a local function, and the new name unused.
+    renames.retain(|f, new| {
+        let mut is_local_fn = false;
+        visit_stats(block, &mut |s| if let Stat::Local { names, values } = s {
+            if names.len() == 1 && names[0] == *f && matches!(values.first(), Some(Expr::Function(_))) { is_local_fn = true; }
+        });
+        is_local_fn && count_refs(block, new) == 0
+    });
+    if renames.is_empty() { return; }
+    rename(block, &renames);
+}
+
+/// `a.b.c` → `a_b_c` (only plain identifier chains).
+fn chain_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Name(n) if lua_ast::is_lua_ident(n) => Some(n.clone()),
+        Expr::Index { table, key } => {
+            let k = key.as_str_utf8().filter(|k| lua_ast::is_lua_ident(k))?;
+            Some(format!("{}_{}", chain_name(table)?, k))
+        }
+        _ => None,
+    }
+}
+
+fn rename(block: &mut Block, map: &BTreeMap<String, String>) {
+    lua_ast::transform_block(block, &mut |e| {
+        if let Expr::Name(n) = e {
+            if let Some(x) = map.get(n) { *n = x.clone(); }
+        }
+    });
+    rename_decls(block, map);
+}
+
+fn rename_decls(block: &mut Block, map: &BTreeMap<String, String>) {
+    for s in block.iter_mut() {
+        if let Stat::Local { names, values } = s {
+            for n in names.iter_mut() { if let Some(x) = map.get(n) { *n = x.clone(); } }
+            for v in values.iter_mut() { rename_in_functions(v, map); }
+        }
+        match s {
+            Stat::Do(b) | Stat::While { body: b, .. } | Stat::Repeat { body: b, .. }
+            | Stat::NumFor { body: b, .. } | Stat::GenFor { body: b, .. } => rename_decls(b, map),
             Stat::If { branches, else_body } => {
-                for (_, b) in branches { collect_block(b, mapping); }
-                if let Some(b) = else_body { collect_block(b, mapping); }
+                for (_, b) in branches.iter_mut() { rename_decls(b, map); }
+                if let Some(b) = else_body { rename_decls(b, map); }
             }
+            Stat::Assign { rhs, .. } => { for v in rhs.iter_mut() { rename_in_functions(v, map); } }
+            Stat::Call(e) => rename_in_functions(e, map),
+            Stat::Return(v) => { for e in v.iter_mut() { rename_in_functions(e, map); } }
             _ => {}
         }
     }
 }
 
-fn collect_expr(expr: &Expr, mapping: &mut BTreeMap<String, Expr>) {
-    match expr {
-        Expr::Function(fb) => collect_block(&fb.body, mapping),
-        Expr::Call { func, args } => {
-            collect_expr(func, mapping);
-            for a in args { collect_expr(a, mapping); }
-        }
-        Expr::Index { table, key } => {
-            collect_expr(table, mapping);
-            collect_expr(key, mapping);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            collect_expr(lhs, mapping);
-            collect_expr(rhs, mapping);
-        }
-        Expr::UnOp { operand, .. } => collect_expr(operand, mapping),
-        Expr::Table(fields) => {
-            for field in fields {
-                match field {
-                    TableField::IndexField(k, v) => { collect_expr(k, mapping); collect_expr(v, mapping); }
-                    TableField::NameField(_, v) => collect_expr(v, mapping),
-                    TableField::ValueField(v) => collect_expr(v, mapping),
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Application: replace _fN with CHAIN everywhere (except defining assignment)
-// ---------------------------------------------------------------------------
-
-fn apply_block(block: &mut Block, mapping: &BTreeMap<String, Expr>) {
-    for stat in block.iter_mut() {
-        match stat {
-            // Preserve defining assignments: `CHAIN = _fN` — don't touch RHS.
-            Stat::Assign { lhs, rhs }
-                if lhs.len() == 1 && rhs.len() == 1
-                && !matches!(&lhs[0], Expr::Name(_))
-                && is_pure_index_chain(&lhs[0])
-                && matches!(&rhs[0], Expr::Name(n) if mapping.contains_key(n)) =>
-            {
-                // LHS sub-expressions (keys inside the chain) can be substituted
-                // but there are none in a simple chain, so skip entirely.
-            }
-            Stat::Assign { lhs, rhs } => {
-                for e in lhs.iter_mut() { apply_expr(e, mapping); }
-                for e in rhs.iter_mut() { apply_expr(e, mapping); }
-            }
-            Stat::Local { values, .. } => {
-                for v in values.iter_mut() { apply_expr(v, mapping); }
-            }
-            Stat::Return(vals) => {
-                for v in vals.iter_mut() { apply_expr(v, mapping); }
-            }
-            Stat::Call(e) => apply_expr(e, mapping),
-            Stat::Do(b) => apply_block(b, mapping),
-            Stat::While { cond, body } => {
-                apply_expr(cond, mapping);
-                apply_block(body, mapping);
-            }
-            Stat::Repeat { body, cond } => {
-                apply_block(body, mapping);
-                apply_expr(cond, mapping);
-            }
-            Stat::NumFor { from, to, step, body, .. } => {
-                apply_expr(from, mapping);
-                apply_expr(to, mapping);
-                if let Some(s) = step { apply_expr(s, mapping); }
-                apply_block(body, mapping);
-            }
-            Stat::GenFor { iters, body, .. } => {
-                for e in iters.iter_mut() { apply_expr(e, mapping); }
-                apply_block(body, mapping);
-            }
-            Stat::If { branches, else_body } => {
-                for (cond, b) in branches.iter_mut() {
-                    apply_expr(cond, mapping);
-                    apply_block(b, mapping);
-                }
-                if let Some(b) = else_body { apply_block(b, mapping); }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn apply_expr(e: &mut Expr, mapping: &BTreeMap<String, Expr>) {
-    match e {
-        Expr::Name(n) => {
-            if let Some(replacement) = mapping.get(n) {
-                *e = replacement.clone();
-            }
-        }
-        Expr::Function(fb) => apply_block(&mut fb.body, mapping),
-        Expr::Call { func, args } => {
-            apply_expr(func, mapping);
-            for a in args.iter_mut() { apply_expr(a, mapping); }
-        }
-        Expr::Index { table, key } => {
-            apply_expr(table, mapping);
-            apply_expr(key, mapping);
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            apply_expr(lhs, mapping);
-            apply_expr(rhs, mapping);
-        }
-        Expr::UnOp { operand, .. } => apply_expr(operand, mapping),
-        Expr::Table(fields) => {
-            for field in fields.iter_mut() {
-                match field {
-                    TableField::IndexField(k, v) => { apply_expr(k, mapping); apply_expr(v, mapping); }
-                    TableField::NameField(_, v) => apply_expr(v, mapping),
-                    TableField::ValueField(v) => apply_expr(v, mapping),
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_pure_index_chain(e: &Expr) -> bool {
-    match e {
-        Expr::Name(_) => true,
-        Expr::Index { table, key } => {
-            if let Expr::Str(kb) = key.as_ref() {
-                if let Ok(ks) = std::str::from_utf8(kb) {
-                    if lua_ast::is_lua_ident(ks) {
-                        return is_pure_index_chain(table);
-                    }
-                }
-            }
-            false
-        }
-        _ => false,
-    }
+/// Declarations inside function literals (transform_block only renames
+/// expressions).
+fn rename_in_functions(e: &mut Expr, map: &BTreeMap<String, String>) {
+    lua_ast::transform_expr(e, &mut |x| if let Expr::Function(fb) = x { rename_decls(&mut fb.body, map); });
 }

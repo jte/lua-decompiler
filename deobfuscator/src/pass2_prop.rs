@@ -52,6 +52,23 @@ fn collect_assigned_names_deep(stat: &Stat, out: &mut BTreeSet<String>) {
             if let Expr::Name(n) = e { out.insert(n.clone()); }
         }
     }
+    // Closures can assign the local through an upvalue.
+    let mut in_fn = |e: &Expr| collect_in_closures(e, out);
+    match stat {
+        Stat::Assign { lhs, rhs } => { for e in lhs.iter().chain(rhs) { in_fn(e); } }
+        Stat::Local { values, .. } => { for e in values { in_fn(e); } }
+        Stat::Return(v) => { for e in v { in_fn(e); } }
+        Stat::Call(e) => in_fn(e),
+        Stat::While { cond, .. } | Stat::Repeat { cond, .. } => in_fn(cond),
+        Stat::If { branches, .. } => { for (c, _) in branches { in_fn(c); } }
+        Stat::NumFor { from, to, step, .. } => {
+            in_fn(from);
+            in_fn(to);
+            if let Some(s) = step { in_fn(s); }
+        }
+        Stat::GenFor { iters, .. } => { for e in iters { in_fn(e); } }
+        _ => {}
+    }
     match stat {
         Stat::Do(b) | Stat::While { body: b, .. } | Stat::Repeat { body: b, .. }
         | Stat::NumFor { body: b, .. } | Stat::GenFor { body: b, .. } => {
@@ -60,6 +77,29 @@ fn collect_assigned_names_deep(stat: &Stat, out: &mut BTreeSet<String>) {
         Stat::If { branches, else_body } => {
             for (_, b) in branches { for s in b { collect_assigned_names_deep(s, out); } }
             if let Some(b) = else_body { for s in b { collect_assigned_names_deep(s, out); } }
+        }
+        _ => {}
+    }
+}
+
+/// Names assigned anywhere inside function literals within `e`.
+fn collect_in_closures(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Function(fb) => { for s in &fb.body { collect_assigned_names_deep(s, out); } }
+        Expr::Index { table, key } => { collect_in_closures(table, out); collect_in_closures(key, out); }
+        Expr::BinOp { lhs, rhs, .. } => { collect_in_closures(lhs, out); collect_in_closures(rhs, out); }
+        Expr::UnOp { operand, .. } | Expr::Paren(operand) => collect_in_closures(operand, out),
+        Expr::Call { func, args } | Expr::Method { obj: func, args, .. } => {
+            collect_in_closures(func, out);
+            for a in args { collect_in_closures(a, out); }
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::IndexField(k, v) => { collect_in_closures(k, out); collect_in_closures(v, out); }
+                    TableField::NameField(_, v) | TableField::ValueField(v) => collect_in_closures(v, out),
+                }
+            }
         }
         _ => {}
     }
@@ -126,7 +166,7 @@ fn subst_expr_no_closure(e: &mut Expr, consts: &BTreeMap<String, Expr>) {
             subst_expr_no_closure(rhs, consts);
         }
         Expr::UnOp { operand, .. } => subst_expr_no_closure(operand, consts),
-        Expr::Call { func, args } => {
+        Expr::Call { func, args } | Expr::Method { obj: func, args, .. } => {
             subst_expr_no_closure(func, consts);
             for a in args.iter_mut() { subst_expr_no_closure(a, consts); }
         }

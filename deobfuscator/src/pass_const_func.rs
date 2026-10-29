@@ -1,360 +1,277 @@
-/// Pass – Const-return and identity function inlining.
+/// Pass – constant and identity function inlining, constant field reads.
 ///
-/// Phase 1: inline constant-returning functions.
-///   local _fN = function()
-///       local _t0 = {}
-///       if _t0["i"] ~= nil then ... end
-///       return LITERAL
-///   end
-///   → replace every `_fN()` call with LITERAL.
+/// Phase 1: `local f = function() return LITERAL end` → every `f()` becomes
+///          LITERAL.
+/// Phase 2: `local f = function(a, ...) return a end` → `f(x, <pure>...)`
+///          becomes `x` (parenthesised if it is a call: one value only).
+/// Phase 3: a local table whose every use is `t["k"]` with constant keys and
+///          whose fields are each set once (in its constructor or by one
+///          top-level `t["k"] = v` with a stable value): later reads of
+///          `t["k"]` become `v`.
 ///
-/// Phase 2: inline identity functions.
-///   local _fN = function(_p0) ... return _p0 end
-///   → replace every `_fN(EXPR)` call with EXPR.
-///
-/// Phase 3: string-keyed table substitution.
-///   tbl["key"] = VALUE  →  replace all reads of tbl["key"] with VALUE.
+/// Functions and tables are only touched when declared once and never
+/// reassigned; declarations are removed when nothing refers to them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use lua_ast::{Block, Expr, Stat, TableField};
+
 use crate::for_each_block;
+use crate::util::{assigned_names, count_refs, is_pure};
 
 pub fn run(block: &mut Block) {
-    for_each_block(block, &mut process_block);
+    let assigned = assigned_names(block);
+    for_each_block(block, &mut |b| process_block(b, &assigned));
 }
 
-fn process_block(block: &mut Block) {
-    // Phase 1 & 2: function inlining (iterate to fix-point).
+fn process_block(block: &mut Block, assigned: &BTreeSet<String>) {
     for _ in 0..20 {
-        let before = block.len();
-        inline_const_funcs(block);
-        inline_identity_funcs(block);
-        if block.len() == before { break; }
+        let a = inline_const_funcs(block, assigned);
+        let b = inline_identity_funcs(block, assigned);
+        if !a && !b { break; }
     }
+    substitute_table_reads(block, assigned);
+}
 
-    // Phase 3: string-keyed table substitution (iterate to fix-point).
-    for _ in 0..20 {
-        let before = lua_ast::print_block(block, 0);
-        substitute_table_reads(block);
-        if lua_ast::print_block(block, 0) == before { break; }
+/// `local f = function(...) <body> end` declared in this block.
+fn local_functions(block: &Block, assigned: &BTreeSet<String>) -> Vec<(String, lua_ast::FuncBody)> {
+    block.iter().filter_map(|s| match s {
+        Stat::Local { names, values } if names.len() == 1 && values.len() == 1 && !assigned.contains(&names[0]) => {
+            if let Expr::Function(fb) = &values[0] { Some((names[0].clone(), (**fb).clone())) } else { None }
+        }
+        _ => None,
+    }).collect()
+}
+
+fn remove_unused_decls(block: &mut Block, names: &[String]) {
+    for n in names {
+        if count_refs(block, n) == 1 {
+            block.retain(|s| !matches!(s, Stat::Local { names: ns, .. } if ns.len() == 1 && ns[0] == *n));
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 1: const-return function inlining
-// ---------------------------------------------------------------------------
-
-fn inline_const_funcs(block: &mut Block) {
-    // Collect { fn_name → literal } for const-return functions.
-    let mut const_fns: BTreeMap<String, Expr> = BTreeMap::new();
-    for stat in block.iter() {
-        if let Some((name, lit)) = detect_const_func(stat) {
-            const_fns.insert(name, lit);
+fn inline_const_funcs(block: &mut Block, assigned: &BTreeSet<String>) -> bool {
+    let consts: BTreeMap<String, Expr> = local_functions(block, assigned).into_iter().filter_map(|(n, fb)| {
+        match fb.body.as_slice() {
+            [Stat::Return(v)] if v.len() == 1 && v[0].is_literal() && !fb.has_vararg => Some((n, v[0].clone())),
+            _ => None,
         }
-    }
-    if const_fns.is_empty() { return; }
-
-    // Substitute all `fn_name()` calls.
-    lua_ast::transform_block(block, &mut |e| {
-        if let Expr::Call { func, args } = e {
-            if args.is_empty() {
-                if let Expr::Name(n) = func.as_ref() {
-                    if let Some(lit) = const_fns.get(n) {
-                        *e = lit.clone();
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    // Remove the now-inlined function declarations.
-    block.retain(|s| {
-        if let Stat::Local { names, .. } = s {
-            if names.len() == 1 { return !const_fns.contains_key(&names[0]); }
-        }
-        true
-    });
-}
-
-fn detect_const_func(stat: &Stat) -> Option<(String, Expr)> {
-    let (name, fb) = match stat {
-        Stat::Local { names, values } if names.len() == 1 => {
-            if let Expr::Function(fb) = &values[0] { (names[0].clone(), fb) } else { return None; }
-        }
-        _ => return None,
-    };
-
-    if !fb.params.is_empty() || fb.has_vararg { return None; }
-
-    // Body: optional local _t = {} + optional if + return LITERAL
-    let ret = extract_const_return(&fb.body)?;
-    Some((name, ret))
-}
-
-fn extract_const_return(body: &Block) -> Option<Expr> {
-    // Walk statements, skipping `local _t = {}` and `if _t["i"] ~= nil` patterns.
-    let mut ret_expr: Option<Expr> = None;
-    for stat in body {
-        match stat {
-            // local _t0 = {} — obfuscation noise, skip
-            Stat::Local { values, .. } if values.len() == 1 && values[0] == Expr::Table(vec![]) => {}
-            // if _t["i"] ~= nil then ... end — obfuscation noise, skip
-            Stat::If { .. } => {}
-            // return LITERAL
-            Stat::Return(vals) if vals.len() == 1 && vals[0].is_literal() => {
-                ret_expr = Some(vals[0].clone());
-            }
-            _ => return None, // Unexpected statement — not a const function
-        }
-    }
-    ret_expr
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2: identity function inlining
-// ---------------------------------------------------------------------------
-
-fn inline_identity_funcs(block: &mut Block) {
-    let mut id_fns: BTreeMap<String, usize> = BTreeMap::new(); // fn_name → param_count
-    for stat in block.iter() {
-        if let Some((name, nparams)) = detect_identity_func(stat) {
-            id_fns.insert(name, nparams);
-        }
-    }
-    if id_fns.is_empty() { return; }
-
+    }).collect();
+    if consts.is_empty() { return false; }
+    let mut changed = false;
     lua_ast::transform_block(block, &mut |e| {
         if let Expr::Call { func, args } = e {
             if let Expr::Name(n) = func.as_ref() {
-                if let Some(&nparams) = id_fns.get(n) {
-                    if nparams == 1 && args.len() == 1 {
-                        *e = args[0].clone();
-                        return;
-                    } else if nparams == 0 && args.is_empty() {
-                        *e = Expr::Nil;
-                        return;
+                if let Some(lit) = consts.get(n) {
+                    // Arguments are evaluated (and ignored) by the call.
+                    if args.iter().all(is_pure) {
+                        *e = lit.clone();
+                        changed = true;
                     }
                 }
             }
         }
     });
-
-    block.retain(|s| {
-        if let Stat::Local { names, .. } = s {
-            if names.len() == 1 { return !id_fns.contains_key(&names[0]); }
-        }
-        true
-    });
+    remove_unused_decls(block, &consts.keys().cloned().collect::<Vec<_>>());
+    changed
 }
 
-fn detect_identity_func(stat: &Stat) -> Option<(String, usize)> {
-    let (name, fb) = match stat {
-        Stat::Local { names, values } if names.len() == 1 => {
-            if let Expr::Function(fb) = &values[0] { (names[0].clone(), fb) } else { return None; }
+fn inline_identity_funcs(block: &mut Block, assigned: &BTreeSet<String>) -> bool {
+    let ids: BTreeSet<String> = local_functions(block, assigned).into_iter().filter_map(|(n, fb)| {
+        match fb.body.as_slice() {
+            [Stat::Return(v)] if v.len() == 1 && !fb.params.is_empty()
+                && matches!(&v[0], Expr::Name(p) if *p == fb.params[0]) => Some(n),
+            _ => None,
         }
-        _ => return None,
-    };
-
-    let nparams = fb.params.len();
-    // Body: optional local _t = {} + optional if + return _p0
-    for stat in &fb.body {
-        match stat {
-            Stat::Local { values, .. } if values.len() == 1 && values[0] == Expr::Table(vec![]) => {}
-            Stat::If { .. } => {}
-            Stat::Return(vals) if vals.len() == 1 => {
-                match &vals[0] {
-                    Expr::Name(p) if nparams >= 1 && *p == fb.params[0] => {
-                        return Some((name, nparams));
-                    }
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Phase 3: string-keyed table substitution
-// ---------------------------------------------------------------------------
-
-/// True if `e` can be safely substituted as a table value (no side effects).
-fn is_substitutable(e: &Expr) -> bool {
-    e.is_literal()
-        || matches!(e, Expr::Name(_))
-        || matches!(e, Expr::Index { table, key }
-            if matches!(table.as_ref(), Expr::Name(_))
-            && matches!(key.as_ref(), Expr::Str(_)))
-}
-
-fn substitute_table_reads(block: &mut Block) {
-    substitute_table_reads_inner(block, &BTreeMap::new());
-}
-
-fn substitute_table_reads_inner(block: &mut Block, inherited: &BTreeMap<(String, Vec<u8>), Expr>) {
-    use std::collections::BTreeSet;
-
-    // Step 0: collect Name aliases: local ALIAS = ORIG (only direct name aliases)
-    let mut aliases: BTreeMap<String, String> = BTreeMap::new();
-    for stat in block.iter() {
-        if let Stat::Local { names, values } = stat {
-            if names.len() == 1 && values.len() == 1 {
-                if let Expr::Name(orig) = &values[0] {
-                    aliases.insert(names[0].clone(), orig.clone());
-                }
-            }
-        }
-    }
-    // Resolve transitive aliases (A → B → C becomes A → C)
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let snapshot = aliases.clone();
-        for orig in aliases.values_mut() {
-            if let Some(resolved) = snapshot.get(orig.as_str()) {
-                if resolved != orig {
-                    *orig = resolved.clone();
+    }).collect();
+    if ids.is_empty() { return false; }
+    let mut changed = false;
+    lua_ast::transform_block(block, &mut |e| {
+        if let Expr::Call { func, args } = e {
+            if let Expr::Name(n) = func.as_ref() {
+                if ids.contains(n) && !args.is_empty() && args[1..].iter().all(is_pure) {
+                    let a = args[0].clone();
+                    *e = match a {
+                        Expr::Call { .. } | Expr::Method { .. } | Expr::Vararg => Expr::Paren(Box::new(a)),
+                        other => other,
+                    };
                     changed = true;
                 }
             }
         }
+    });
+    remove_unused_decls(block, &ids.into_iter().collect::<Vec<_>>());
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3
+// ---------------------------------------------------------------------------
+
+/// A value that means the same wherever it is read later.
+fn stable(e: &Expr, assigned: &BTreeSet<String>) -> bool {
+    match e {
+        _ if e.is_literal() => true,
+        Expr::Name(n) => !assigned.contains(n),
+        _ => false,
     }
+}
 
-    // Start with inherited table values from outer scopes.
-    let mut table_vals: BTreeMap<(String, Vec<u8>), Expr> = inherited.clone();
-    let mut multi: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
-
-    // Add entries from this block's assignment statements AND inline constructors.
-    // Only include keys assigned exactly once — multiple assignments make
-    // substitution unsafe (we don't know which value is "current").
-    for stat in block.iter() {
-        match stat {
-            Stat::Assign { lhs, rhs } if lhs.len() == 1 && rhs.len() == 1 => {
-                if let Expr::Index { table, key } = &lhs[0] {
-                    if let (Expr::Name(tname), Expr::Str(kb)) = (table.as_ref(), key.as_ref()) {
-                        // Skip the global-env upvalue — its fields are mutable globals,
-                        // not safe to substitute unconditionally.
-                        if tname.starts_with("_upv") { continue; }
-                        if is_substitutable(&rhs[0]) {
-                            let k = (tname.clone(), kb.clone());
-                            if table_vals.contains_key(&k) && !inherited.contains_key(&k) {
-                                multi.insert(k);
-                            } else if !table_vals.contains_key(&k) {
-                                table_vals.insert(k, rhs[0].clone());
-                            }
-                        }
-                    }
-                }
+/// Is every reference to `t` in `b` either a constant-key read or one of the
+/// allowed top-level writes?
+fn only_const_key_uses(b: &Block, t: &str, writes_ok: &BTreeSet<usize>) -> bool {
+    fn ok_expr(e: &Expr, t: &str) -> bool {
+        match e {
+            Expr::Name(n) => n != t,
+            Expr::Index { table, key } if matches!(table.as_ref(), Expr::Name(n) if n == t) => {
+                matches!(key.as_ref(), Expr::Str(_))
             }
-            // Also collect from `local TNAME = { [key] = val, ... }` constructors.
-            Stat::Local { names, values }
-                if names.len() == 1 && values.len() == 1 =>
-            {
-                if let Expr::Table(fields) = &values[0] {
-                    let tname = &names[0];
-                    if tname.starts_with("_upv") { continue; }
-                    for field in fields {
-                        if let TableField::IndexField(k_expr, v_expr) = field {
-                            if let Expr::Str(kb) = k_expr {
-                                if is_substitutable(v_expr) {
-                                    let k = (tname.clone(), kb.clone());
-                                    if !table_vals.contains_key(&k) {
-                                        table_vals.insert(k, v_expr.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
+            _ => {
+                let mut ok = true;
+                match e {
+                    Expr::Index { table, key } => ok = ok_expr(table, t) && ok_expr(key, t),
+                    Expr::Call { func, args } => ok = ok_expr(func, t) && args.iter().all(|a| ok_expr(a, t)),
+                    Expr::Method { obj, args, .. } => ok = ok_expr(obj, t) && args.iter().all(|a| ok_expr(a, t)),
+                    Expr::BinOp { lhs, rhs, .. } => ok = ok_expr(lhs, t) && ok_expr(rhs, t),
+                    Expr::UnOp { operand, .. } | Expr::Paren(operand) => ok = ok_expr(operand, t),
+                    Expr::Table(fields) => ok = fields.iter().all(|f| match f {
+                        TableField::IndexField(k, v) => ok_expr(k, t) && ok_expr(v, t),
+                        TableField::NameField(_, v) | TableField::ValueField(v) => ok_expr(v, t),
+                    }),
+                    Expr::Function(fb) => ok = fb.body.iter().all(|s| ok_stat(s, t)),
+                    _ => {}
                 }
-            }
-            _ => {}
-        }
-    }
-    for k in multi { table_vals.remove(&k); }
-
-    // Add alias entries: if ALIAS → ORIG is an alias, add (ALIAS, key) entries
-    // for every (ORIG, key) entry in table_vals.
-    let orig_entries: Vec<((String, Vec<u8>), Expr)> = table_vals
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (alias, orig) in &aliases {
-        for ((tname, key), val) in &orig_entries {
-            if tname == orig {
-                table_vals.entry((alias.clone(), key.clone())).or_insert_with(|| val.clone());
+                ok
             }
         }
     }
-
-    if table_vals.is_empty() { return; }
-
-    // Substitute reads only — NOT the LHS of assignments.
-    // Use manual iteration so we can skip LHS table-index positions.
-    for stat in block.iter_mut() {
-        match stat {
-            Stat::Assign { lhs, rhs } => {
-                // For LHS, only substitute inside index sub-expressions (not the
-                // top-level Index node itself, which is the assignment target).
-                for e in lhs.iter_mut() {
-                    match e {
-                        Expr::Index { table, key } => {
-                            subst_reads(table, &table_vals);
-                            subst_reads(key, &table_vals);
-                        }
-                        _ => {}
-                    }
+    fn ok_stat(s: &Stat, t: &str) -> bool {
+        match s {
+            Stat::Assign { lhs, rhs } => lhs.iter().all(|l| match l {
+                Expr::Name(n) => n != t,
+                Expr::Index { table, key } if matches!(table.as_ref(), Expr::Name(n) if n == t) => {
+                    let _ = key;
+                    false
                 }
-                for e in rhs.iter_mut() { subst_reads(e, &table_vals); }
-            }
-            Stat::Local { values, .. } => {
-                for v in values.iter_mut() { subst_reads(v, &table_vals); }
-            }
-            Stat::Return(vals) => {
-                for v in vals.iter_mut() { subst_reads(v, &table_vals); }
-            }
-            Stat::Call(e) => subst_reads(e, &table_vals),
+                other => ok_expr(other, t),
+            }) && rhs.iter().all(|e| ok_expr(e, t)),
+            Stat::Local { names, values } => !names.iter().any(|n| n == t) && values.iter().all(|e| ok_expr(e, t)),
+            Stat::While { cond, body } | Stat::Repeat { body, cond } => ok_expr(cond, t) && body.iter().all(|s| ok_stat(s, t)),
             Stat::If { branches, else_body } => {
-                for (cond, body) in branches.iter_mut() {
-                    subst_reads(cond, &table_vals);
-                    substitute_table_reads_inner(body, &table_vals);
-                }
-                if let Some(b) = else_body { substitute_table_reads_inner(b, &table_vals); }
-            }
-            Stat::While { cond, body } => {
-                subst_reads(cond, &table_vals);
-                substitute_table_reads_inner(body, &table_vals);
-            }
-            Stat::Repeat { body, cond } => {
-                substitute_table_reads_inner(body, &table_vals);
-                subst_reads(cond, &table_vals);
+                branches.iter().all(|(c, b)| ok_expr(c, t) && b.iter().all(|s| ok_stat(s, t)))
+                    && else_body.as_ref().map_or(true, |b| b.iter().all(|s| ok_stat(s, t)))
             }
             Stat::NumFor { from, to, step, body, .. } => {
-                subst_reads(from, &table_vals);
-                subst_reads(to, &table_vals);
-                if let Some(s) = step { subst_reads(s, &table_vals); }
-                substitute_table_reads_inner(body, &table_vals);
+                ok_expr(from, t) && ok_expr(to, t) && step.as_ref().map_or(true, |s| ok_expr(s, t))
+                    && body.iter().all(|s| ok_stat(s, t))
             }
-            Stat::GenFor { iters, body, .. } => {
-                for e in iters.iter_mut() { subst_reads(e, &table_vals); }
-                substitute_table_reads_inner(body, &table_vals);
+            Stat::GenFor { iters, body, .. } => iters.iter().all(|e| ok_expr(e, t)) && body.iter().all(|s| ok_stat(s, t)),
+            Stat::Do(b) => b.iter().all(|s| ok_stat(s, t)),
+            Stat::Return(v) => v.iter().all(|e| ok_expr(e, t)),
+            Stat::Call(e) => ok_expr(e, t),
+            _ => true,
+        }
+    }
+    b.iter().enumerate().all(|(i, s)| {
+        if writes_ok.contains(&i) {
+            // The allowed `t["k"] = v`: only the value is checked.
+            if let Stat::Assign { rhs, .. } = s { return rhs.iter().all(|e| ok_expr(e, t)); }
+        }
+        if let Stat::Local { names, values } = s {
+            if names.len() == 1 && names[0] == t { return values.iter().all(|e| ok_expr(e, t)); }
+        }
+        ok_stat(s, t)
+    })
+}
+
+fn substitute_table_reads(block: &mut Block, assigned: &BTreeSet<String>) {
+    for decl in 0..block.len() {
+        let (t, fields) = match &block[decl] {
+            Stat::Local { names, values } if names.len() == 1 && values.len() == 1 && !assigned.contains(&names[0]) => {
+                match &values[0] { Expr::Table(f) => (names[0].clone(), f.clone()), _ => continue }
             }
-            Stat::Do(body) => substitute_table_reads_inner(body, &table_vals),
-            _ => {}
+            _ => continue,
+        };
+        // Field values known from the constructor (available from decl on).
+        let mut known: BTreeMap<Vec<u8>, (Expr, usize)> = BTreeMap::new();
+        let mut set_count: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+        for f in &fields {
+            let (k, v) = match f {
+                TableField::NameField(k, v) => (k.as_bytes().to_vec(), v),
+                TableField::IndexField(Expr::Str(k), v) => (k.clone(), v),
+                _ => continue,
+            };
+            *set_count.entry(k.clone()).or_default() += 1;
+            if stable(v, assigned) { known.insert(k, (v.clone(), decl)); }
+        }
+        // Single top-level writes `t["k"] = v` after the declaration.
+        let mut writes_ok = BTreeSet::new();
+        for (i, s) in block.iter().enumerate().skip(decl + 1) {
+            if let Stat::Assign { lhs, rhs } = s {
+                if lhs.len() == 1 && rhs.len() == 1 {
+                    if let Expr::Index { table, key } = &lhs[0] {
+                        if matches!(table.as_ref(), Expr::Name(n) if *n == t) {
+                            if let Expr::Str(k) = key.as_ref() {
+                                writes_ok.insert(i);
+                                *set_count.entry(k.clone()).or_default() += 1;
+                                if stable(&rhs[0], assigned) { known.insert(k.clone(), (rhs[0].clone(), i)); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        known.retain(|k, _| set_count.get(k) == Some(&1));
+        if known.is_empty() || !only_const_key_uses(block, &t, &writes_ok) { continue; }
+        // Substitute reads in statements after each field's definition.
+        for i in decl + 1..block.len() {
+            let avail: BTreeMap<Vec<u8>, Expr> = known.iter()
+                .filter(|(_, (_, at))| *at < i)
+                .map(|(k, (v, _))| (k.clone(), v.clone()))
+                .collect();
+            if avail.is_empty() { continue; }
+            let mut one = vec![std::mem::replace(&mut block[i], Stat::Break)];
+            subst_reads(&mut one, &t, &avail);
+            block[i] = one.pop().unwrap();
         }
     }
 }
 
-fn subst_reads(e: &mut Expr, table_vals: &BTreeMap<(String, Vec<u8>), Expr>) {
-    lua_ast::transform_expr(e, &mut |node| {
+/// Replace `t["k"]` reads (not assignment targets) with known values.
+fn subst_reads(b: &mut Block, t: &str, vals: &BTreeMap<Vec<u8>, Expr>) {
+    let sub = |e: &mut Expr| lua_ast::transform_expr(e, &mut |node| {
         if let Expr::Index { table, key } = node {
-            if let (Expr::Name(tname), Expr::Str(kb)) = (table.as_ref(), key.as_ref()) {
-                let k = (tname.clone(), kb.clone());
-                if let Some(val) = table_vals.get(&k) {
-                    *node = val.clone();
-                }
+            if let (Expr::Name(n), Expr::Str(k)) = (table.as_ref(), key.as_ref()) {
+                if n == t { if let Some(v) = vals.get(k) { *node = v.clone(); } }
             }
         }
     });
+    for s in b.iter_mut() {
+        match s {
+            Stat::Assign { lhs, rhs } => {
+                for l in lhs.iter_mut() {
+                    if let Expr::Index { table, key } = l {
+                        if matches!(table.as_ref(), Expr::Name(n) if n == t) { sub(key); } else { sub(table); sub(key); }
+                    }
+                }
+                for e in rhs.iter_mut() { sub(e); }
+            }
+            Stat::Local { values, .. } => { for e in values.iter_mut() { sub(e); } }
+            Stat::Return(v) => { for e in v.iter_mut() { sub(e); } }
+            Stat::Call(e) => sub(e),
+            Stat::While { cond, body } | Stat::Repeat { body, cond } => { sub(cond); subst_reads(body, t, vals); }
+            Stat::If { branches, else_body } => {
+                for (c, b) in branches.iter_mut() { sub(c); subst_reads(b, t, vals); }
+                if let Some(b) = else_body { subst_reads(b, t, vals); }
+            }
+            Stat::NumFor { from, to, step, body, .. } => {
+                sub(from); sub(to);
+                if let Some(s) = step { sub(s); }
+                subst_reads(body, t, vals);
+            }
+            Stat::GenFor { iters, body, .. } => { for e in iters.iter_mut() { sub(e); } subst_reads(body, t, vals); }
+            Stat::Do(b) => subst_reads(b, t, vals),
+            _ => {}
+        }
+    }
 }

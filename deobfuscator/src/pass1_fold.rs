@@ -35,9 +35,12 @@ fn fold_binop(op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
                 BinOp::Add  => Some(Expr::Integer(a.wrapping_add(b))),
                 BinOp::Sub  => Some(Expr::Integer(a.wrapping_sub(b))),
                 BinOp::Mul  => Some(Expr::Integer(a.wrapping_mul(b))),
-                BinOp::IDiv if b != 0 => Some(Expr::Integer(a.div_euclid(b))),
-                BinOp::Mod  if b != 0 => Some(Expr::Integer(a.rem_euclid(b))),
-                BinOp::Pow  if b >= 0 && b <= 18 => Some(Expr::Integer(a.wrapping_pow(b as u32))),
+                // Lua floors (rounds toward -inf), unlike Rust's euclidean ops.
+                BinOp::IDiv if b != 0 => Some(Expr::Integer(floor_div(a, b))),
+                BinOp::Mod  if b != 0 => Some(Expr::Integer(a.wrapping_sub(floor_div(a, b).wrapping_mul(b)))),
+                // `^` and `/` always produce floats.
+                BinOp::Pow  => Some(Expr::Float((a as f64).powf(b as f64))),
+                BinOp::Div  if b != 0 => Some(Expr::Float(a as f64 / b as f64)),
                 BinOp::BAnd => Some(Expr::Integer(a & b)),
                 BinOp::BOr  => Some(Expr::Integer(a | b)),
                 BinOp::BXor => Some(Expr::Integer(a ^ b)),
@@ -112,6 +115,11 @@ fn fold_binop(op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
         _ => {}
     }
     None
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a.wrapping_div(b);
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
 }
 
 fn fold_unop(op: &UnOp, operand: &Expr) -> Option<Expr> {
