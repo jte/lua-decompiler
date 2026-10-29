@@ -1,0 +1,11 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+decompiler = { path = "../decompiler" }
+disassembler = { path = "../disassembler" }
+deobfuscator = { path = "../deobfuscator" }
+lua_ast = { path = "../lua_ast" }
+luac-parser = { git = "https://github.com/jte/luac-parser-rs" }

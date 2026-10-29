@@ -1,0 +1,13 @@
+// Cloudflare deployment config: serves the static site in dist/ (built by
+// `npm run build`). Deploy with `npm run deploy`.
+{
+  "name": "lua-decompiler",
+  "compatibility_date": "2026-10-23",
+  "assets": {
+    "directory": "./dist"
+  },
+  // Kept in sync with the dashboard setting (Workers Logs off).
+  "observability": {
+    "enabled": false
+  }
+}

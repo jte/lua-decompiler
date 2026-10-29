@@ -6,8 +6,5 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 utils = { path = "../utils" }
-decompiler = { path = "../decompiler" }
-disassembler = { path = "../disassembler" }
+engine = { path = "../engine" }
 luac-parser = { git = "https://github.com/jte/luac-parser-rs" }
-deobfuscator = { path = "../deobfuscator" }
-lua_ast = { path = "../lua_ast" }

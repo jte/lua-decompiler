@@ -1,4 +1,8 @@
 /target
+/web/www/pkg
+/web/dist
+/web/.wrangler
+node_modules/
 samples/deobf.lua
 samples/deobf_out.txt
 samples/disasm.txt
