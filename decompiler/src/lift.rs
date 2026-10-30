@@ -51,15 +51,38 @@ pub fn const_expr(c: Option<&LuaConstant>) -> Expr {
             }),
             args: vec![Expr::Float(*x), Expr::Float(*y), Expr::Float(*z)],
         },
+        // LuaJIT FFI literals (`1LL`, `2ULL`, `3i`), printed verbatim.
+        Some(c @ (LuaConstant::Int64(_) | LuaConstant::UInt64(_) | LuaConstant::Complex(..))) => {
+            Expr::Name(c.cdata_literal().unwrap())
+        }
         Some(_) => Expr::Nil,
     }
 }
 
-/// A Luau DUPTABLE template: the fields that come with a value (the others
-/// are filled in by the stores that follow).
+/// A Luau DUPTABLE or LuaJIT TDUP template: the fields that come with a
+/// value (the others are filled in by the stores that follow).  LuaJIT's
+/// array part starts at index 0.
 fn template_expr(c: Option<&LuaConstant>) -> Expr {
     let mut fields = Vec::new();
     if let Some(LuaConstant::Table(t)) = c {
+        let last = t.array.iter().rposition(|v| !matches!(v, LuaConstant::Null)).unwrap_or(0);
+        if let Some(v) = t.array.first().filter(|v| !matches!(v, LuaConstant::Null)) {
+            fields.push(TableField::IndexField(Expr::Integer(0), const_expr(Some(v))));
+        }
+        // Positional while the holes are single nils (`{1, nil, 3}`); after a
+        // longer gap the entries were most likely written with keys.
+        let mut positional = true;
+        for (i, v) in t.array.iter().enumerate().take(last + 1).skip(1) {
+            let null = matches!(v, LuaConstant::Null);
+            if null && t.array.get(i + 1).map_or(true, |n| matches!(n, LuaConstant::Null)) {
+                positional = false;
+            }
+            if positional {
+                fields.push(TableField::ValueField(const_expr(Some(v))));
+            } else if !null {
+                fields.push(TableField::IndexField(Expr::Integer(i as i64), const_expr(Some(v))));
+            }
+        }
         for (k, v) in &t.hash {
             if matches!(v, LuaConstant::Null) { continue; }
             let (k, v) = (const_expr(Some(k)), const_expr(Some(v)));
@@ -254,6 +277,48 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// LuaJIT has no SELF: `obj:m(args)` is `MOV f+1 obj; TGETS f obj "m"`
+    /// (f+2 with FR2) and a CALL of f.  Fold that back into a method call
+    /// when the two copies are only used by the call.
+    fn jit_methods(&mut self, b: usize) {
+        let an = self.an;
+        let node = &self.flow.nodes[b];
+        let arg0 = self.proto.jit_arg_offset();
+        let single = |v: VarId| an.vars[v].uses == 1 && an.vars[v].defs == 1 && !self.boxed_vars.contains(&v);
+        for i in 1..node.ops.len() {
+            let (Op::Pc(pm), Op::Pc(pg)) = (node.ops[i - 1], node.ops[i]) else { continue };
+            let Ins::Move { a: ma, .. } = self.d.ins[pm] else { continue };
+            let Ins::GetTable { a, key: Rk::K(k), .. } = self.d.ins[pg] else { continue };
+            if ma != a + arg0 { continue; }
+            let Expr::Str(name) = self.k(k) else { continue };
+            let Ok(name) = String::from_utf8(name) else { continue };
+            if !is_lua_ident(&name) { continue; }
+            let (mi, gi) = (&an.ops[b][i - 1], &an.ops[b][i]);
+            // Same receiver: the MOV's source and the table indexed.
+            if mi.use_var.first() != gi.use_var.first() || mi.use_var.is_empty() { continue; }
+            let (Some(vf), Some(vs)) = (gi.def_of(a), mi.def_of(ma)) else { continue };
+            if !single(vf) || !single(vs) { continue; }
+            for (j, &op2) in node.ops.iter().enumerate().skip(i + 1) {
+                let Op::Pc(pc2) = op2 else { break };
+                match &self.d.ins[pc2] {
+                    Ins::Call { a: ca, .. } | Ins::TailCall { a: ca, .. } if *ca == a => {
+                        let ci = &an.ops[b][j];
+                        if ci.use_var.first() == Some(&vf) && ci.use_var.get(1) == Some(&vs) {
+                            self.skip_pc.insert(pm);
+                            self.skip_pc.insert(pg);
+                            self.method_at.insert(pc2, (mi.use_var[0], name.clone()));
+                        }
+                        break;
+                    }
+                    other => {
+                        let touches = an.ops[b][j].defs.iter().any(|&r| r == a || r == ma);
+                        if touches || matches!(other, Ins::Jmp { .. }) { break; }
+                    }
+                }
+            }
+        }
+    }
+
     fn lift_node(&mut self, b: usize) -> IrBlock {
         let flow = self.flow;
         let an = self.an;
@@ -294,6 +359,7 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
+        if self.proto.jit > 0 { self.jit_methods(b); }
         for (i, &op) in node.ops.iter().enumerate() {
             let info = &an.ops[b][i];
             let start = out.stmts.len();
@@ -438,7 +504,7 @@ impl<'a> Lifter<'a> {
                             let l = global(self.k(*k), "_G");
                             Some(assign(l, u(*a)))
                         }
-                        Ins::SetUpval { a, up } => Some(assign(self.upval(*up), u(*a))),
+                        Ins::SetUpval { up, val } => Some(assign(self.upval(*up), rk(*val))),
                         Ins::SetTable { t, key, val } => {
                             Some(assign(Expr::Index { table: Box::new(u(*t)), key: Box::new(rk(*key)) }, rk(*val)))
                         }
@@ -448,7 +514,14 @@ impl<'a> Lifter<'a> {
                             Some(assign(dv(*a), Expr::Index { table: Box::new(u(*obj)), key: Box::new(rk(*key)) }))
                         }
                         Ins::Arith { a, op, l, r } => {
-                            Some(assign(dv(*a), Expr::BinOp { op: op.clone(), lhs: Box::new(rk(*l)), rhs: Box::new(rk(*r)) }))
+                            let e = match (self.proto.jit > 0).then(|| jit_bit_fn(op)).flatten() {
+                                Some(f) => bit_call(f, vec![rk(*l), rk(*r)]),
+                                None => Expr::BinOp { op: op.clone(), lhs: Box::new(rk(*l)), rhs: Box::new(rk(*r)) },
+                            };
+                            Some(assign(dv(*a), e))
+                        }
+                        Ins::Unary { a, op: UnOp::BNot, b } if self.proto.jit > 0 => {
+                            Some(assign(dv(*a), bit_call("bnot", vec![u(*b)])))
                         }
                         Ins::Unary { a, op, b } => {
                             Some(assign(dv(*a), Expr::UnOp { op: op.clone(), operand: Box::new(u(*b)) }))
@@ -541,6 +614,32 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
+    }
+}
+
+/// LuaJIT bit operator instructions behave like the `bit` library (32-bit,
+/// shift counts mod 32), which every LuaJIT has.  The decoder marks BSAR
+/// (`>>>`) as IDiv, which LuaJIT does not have otherwise.
+fn jit_bit_fn(op: &BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::BAnd => "band",
+        BinOp::BOr => "bor",
+        BinOp::BXor => "bxor",
+        BinOp::Shl => "lshift",
+        BinOp::Shr => "rshift",
+        BinOp::IDiv => "arshift",
+        _ => return None,
+    })
+}
+
+/// `bit.<f>(args)`.
+fn bit_call(f: &str, args: Vec<Expr>) -> Expr {
+    Expr::Call {
+        func: Box::new(Expr::Index {
+            table: Box::new(global(Expr::Str(b"bit".to_vec()), "_G")),
+            key: Box::new(Expr::Str(f.as_bytes().to_vec())),
+        }),
+        args,
     }
 }
 

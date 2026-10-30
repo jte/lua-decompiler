@@ -124,7 +124,8 @@ fn uses_defs(
             Ins::GetTabUp { a, key, .. } => { rk_regs(&mut u, *key); df.push(*a); }
             Ins::GetTable { a, t, key } => { u.push(*t); rk_regs(&mut u, *key); df.push(*a); }
             Ins::SetTabUp { key, val, .. } => { rk_regs(&mut u, *key); rk_regs(&mut u, *val); }
-            Ins::SetGlobal { a, .. } | Ins::SetUpval { a, .. } => u.push(*a),
+            Ins::SetGlobal { a, .. } => u.push(*a),
+            Ins::SetUpval { val, .. } => rk_regs(&mut u, *val),
             Ins::SetTable { t, key, val } => { u.push(*t); rk_regs(&mut u, *key); rk_regs(&mut u, *val); }
             // Lifted as `A+1 = obj; A = obj[key]`: two reads of obj.
             Ins::SelfOp { a, obj, key } => { u.push(*obj); u.push(*obj); rk_regs(&mut u, *key); df.push(*a + 1); df.push(*a); }
@@ -134,22 +135,22 @@ fn uses_defs(
             Ins::Cmp { l, r, .. } => { rk_regs(&mut u, *l); rk_regs(&mut u, *r); }
             Ins::Test { a, .. } => u.push(*a),
             Ins::TestSet { b, .. } => u.push(*b),
-            Ins::Call { a, nargs, nret } => {
+            Ins::Call { a, args, nargs, nret } => {
                 u.push(*a);
                 match nargs {
-                    Some(k) => { for r in a + 1..=a + k { u.push(r); } }
-                    None => range_to_top(a + 1, pc, &mut u),
+                    Some(k) => { for r in *args..args + k { u.push(r); } }
+                    None => range_to_top(*args, pc, &mut u),
                 }
                 match nret {
                     Some(k) => { for r in *a..a + k { df.push(r); } }
                     None => df.push(*a),
                 }
             }
-            Ins::TailCall { a, nargs } => {
+            Ins::TailCall { a, args, nargs } => {
                 u.push(*a);
                 match nargs {
-                    Some(k) => { for r in a + 1..=a + k { u.push(r); } }
-                    None => range_to_top(a + 1, pc, &mut u),
+                    Some(k) => { for r in *args..args + k { u.push(r); } }
+                    None => range_to_top(*args, pc, &mut u),
                 }
             }
             Ins::Return { a, n } => match n {

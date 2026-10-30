@@ -311,6 +311,7 @@ fn decompile_fn(
             i.captured || i.param.is_some() || debug.contains_key(&v)
         }).collect(),
         pack: pack_vars(&d, &flow, &an),
+        positional_keys: proto.jit > 0,
     };
     // Luau by-value captures name a variable for the closure: keep it.
     for v in val_captured(&d, &flow, &an) { facts.pinned[v] = true; }
@@ -394,6 +395,10 @@ fn decompile_fn(
     if proto.luau {
         // Used by the flat form of generalized iteration.
         for g in ["type", "getmetatable"] { avoid.insert(g.into()); }
+    }
+    if proto.jit > 0 {
+        // LuaJIT bit operator instructions are printed as `bit.*` calls.
+        avoid.insert("bit".into());
     }
     let names = names::assign(&all, &params, &debug, &kinds, &avoid);
     declare::rename(&mut body, &names);

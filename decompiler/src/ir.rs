@@ -69,7 +69,8 @@ pub enum Ins {
     GetTable { a: Reg, t: Reg, key: Rk },
     SetTabUp { up: u16, key: Rk, val: Rk },
     SetGlobal { a: Reg, k: u32 },
-    SetUpval { a: Reg, up: u16 },
+    /// `up := val`.
+    SetUpval { up: u16, val: Rk },
     SetTable { t: Reg, key: Rk, val: Rk },
     NewTable { a: Reg },
     SelfOp { a: Reg, obj: Reg, key: Rk },
@@ -84,9 +85,9 @@ pub enum Ins {
     Test { a: Reg, expect: bool },
     /// If `truthy(b) == expect` then `a := b` else skip the next instruction.
     TestSet { a: Reg, b: Reg, expect: bool },
-    /// `nargs`/`nret`: `None` means "up to top" / "all results".
-    Call { a: Reg, nargs: Option<u16>, nret: Option<u16> },
-    TailCall { a: Reg, nargs: Option<u16> },
+    /// `nargs`/`nret`: `None` means "up to top" / "all results".  The`n    /// arguments start at `args` (R(a+1), or R(a+2) in LuaJIT with FR2).
+    Call { a: Reg, args: Reg, nargs: Option<u16>, nret: Option<u16> },
+    TailCall { a: Reg, args: Reg, nargs: Option<u16> },
     Return { a: Reg, n: Option<u16> },
     /// `init`: the registers holding (start, limit, step) — R(a), R(a+1),
     /// R(a+2) except in Luau (R(a+2), R(a), R(a+1)).
@@ -148,6 +149,7 @@ fn target(pc: usize, sbx: i32) -> usize {
 
 pub fn decode(proto: &Proto) -> Decoded {
     if proto.luau { return decode_luau(proto); }
+    if proto.jit > 0 { return decode_luajit(proto); }
     if proto.version >= 0x54 { return decode54(proto); }
     let v51 = proto.version == 0x51;
     let code = &proto.code;
@@ -189,7 +191,7 @@ pub fn decode(proto: &Proto) -> Decoded {
             OpCode::GetTable => Ins::GetTable { a, t: b as Reg, key: rk(c) },
             OpCode::SetTabUp => Ins::SetTabUp { up: a as u16, key: rk(b), val: rk(c) },
             OpCode::SetGlobal => Ins::SetGlobal { a, k: bx },
-            OpCode::SetUpVal => Ins::SetUpval { a, up: b as u16 },
+            OpCode::SetUpVal => Ins::SetUpval { up: b as u16, val: Rk::R(a) },
             OpCode::SetTable => Ins::SetTable { t: a, key: rk(b), val: rk(c) },
             OpCode::NewTable => Ins::NewTable { a },
             OpCode::Self_ => Ins::SelfOp { a, obj: b as Reg, key: rk(c) },
@@ -231,8 +233,8 @@ pub fn decode(proto: &Proto) -> Decoded {
             }
             OpCode::Test => Ins::Test { a, expect: c != 0 },
             OpCode::TestSet => Ins::TestSet { a, b: b as Reg, expect: c != 0 },
-            OpCode::Call => Ins::Call { a, nargs: opt(b), nret: opt(c) },
-            OpCode::TailCall => Ins::TailCall { a, nargs: opt(b) },
+            OpCode::Call => Ins::Call { a, args: a + 1, nargs: opt(b), nret: opt(c) },
+            OpCode::TailCall => Ins::TailCall { a, args: a + 1, nargs: opt(b) },
             OpCode::Return => Ins::Return { a, n: opt(b) },
             OpCode::ForPrep => Ins::ForPrep { a, target: target(pc, sbx), init: [a, a + 1, a + 2] },
             OpCode::ForLoop => Ins::ForLoop { a, var: a + 3, target: target(pc, sbx) },
@@ -425,7 +427,7 @@ fn decode54(proto: &Proto) -> Decoded {
             7 => Ins::LoadBool { a, val: true, skip: false },
             8 => Ins::LoadNil { a, last: a + b as Reg },
             9 => Ins::GetUpval { a, up: b as u16 },
-            10 => Ins::SetUpval { a, up: b as u16 },
+            10 => Ins::SetUpval { up: b as u16, val: Rk::R(a) },
             11 => Ins::GetTabUp { a, up: b as u16, key: Rk::K(c) },
             12 => Ins::GetTable { a, t: b as Reg, key: Rk::R(c as Reg) },
             13 => Ins::GetTable { a, t: b as Reg, key: Rk::Int(c as i64) },
@@ -471,8 +473,8 @@ fn decode54(proto: &Proto) -> Decoded {
             65 => Ins::Cmp { op: CmpOp::Le, expect: k, l: imm(i), r: Rk::R(a) },
             66 => Ins::Test { a, expect: k },
             67 => Ins::TestSet { a, b: b as Reg, expect: k },
-            68 => Ins::Call { a, nargs: opt(b), nret: opt(c) },
-            69 => Ins::TailCall { a, nargs: opt(b) },
+            68 => Ins::Call { a, args: a + 1, nargs: opt(b), nret: opt(c) },
+            69 => Ins::TailCall { a, args: a + 1, nargs: opt(b) },
             70 => Ins::Return { a, n: opt(b) },
             71 => Ins::Return { a: 0, n: Some(0) },
             72 => Ins::Return { a, n: Some(1) },
@@ -626,7 +628,7 @@ fn decode_luau(proto: &Proto) -> Decoded {
             lop::GETGLOBAL => Ins::GetGlobal { a, k: aux },
             lop::SETGLOBAL => Ins::SetGlobal { a, k: aux },
             lop::GETUPVAL => Ins::GetUpval { a, up: b as u16 },
-            lop::SETUPVAL => Ins::SetUpval { a, up: b as u16 },
+            lop::SETUPVAL => Ins::SetUpval { up: b as u16, val: Rk::R(a) },
             lop::CLOSEUPVALS => Ins::Close { a },
             lop::GETIMPORT => {
                 let count = aux >> 30;
@@ -669,7 +671,7 @@ fn decode_luau(proto: &Proto) -> Decoded {
             }
             lop::NAMECALL => Ins::SelfOp { a, obj: b as Reg, key: Rk::K(aux) },
             lop::NAMECALLUDATA => Ins::SelfOp { a, obj: b as Reg, key: Rk::K(aux & 0xFFFF) },
-            lop::CALL => Ins::Call { a, nargs: opt(b), nret: opt(c) },
+            lop::CALL => Ins::Call { a, args: a + 1, nargs: opt(b), nret: opt(c) },
             lop::RETURN => Ins::Return { a, n: opt(b) },
             lop::JUMP | lop::JUMPBACK => Ins::Jmp { target: jd, close: None },
             lop::JUMPX => Ins::Jmp { target: to(((i as i32) >> 8) as i64), close: None },
@@ -738,6 +740,125 @@ fn decode_luau(proto: &Proto) -> Decoded {
         } else {
             pc += len.max(1);
         }
+    }
+    finish(ins, data)
+}
+
+/// LuaJIT (src/lj_bc.h): `B:8 C:8 A:8 OP:8` or `D:16 A:8 OP:8`; jumps are
+/// `pc + 1 + D - 0x8000`.  Comparisons and tests are followed by a JMP
+/// taken when they hold, like Lua's.  GC constants are `K(D)`, number
+/// constants `K(nkgc + D)`.
+fn decode_luajit(proto: &Proto) -> Decoded {
+    use disassembler::luajit::{self as lj, canon_op};
+    let code = &proto.code;
+    let n = code.len();
+    let mut ins: Vec<Ins> = vec![Ins::Unknown; n];
+    let mut data = vec![false; n];
+    let nk = proto.nkgc as u32;
+    let arg0 = proto.jit_arg_offset();
+    let pri = |d: u32| match d { 0 => Rk::Nil, 1 => Rk::Bool(false), _ => Rk::Bool(true) };
+    let opt = |v: u32| if v == 0 { None } else { Some((v - 1) as u16) };
+    for pc in 0..n {
+        let i = code[pc];
+        let op = canon_op(proto.jit, i & 0xFF);
+        let a = ((i >> 8) & 0xFF) as Reg;
+        let c = (i >> 16) & 0xFF;
+        let b = i >> 24;
+        let d = i >> 16;
+        let jt = {
+            let t = pc as i64 + 1 + d as i64 - 0x8000;
+            if t < 0 { usize::MAX } else { t as usize }
+        };
+        let r = |x: u32| Rk::R(x as Reg);
+        let arith = |k: u32| [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod][k as usize].clone();
+        ins[pc] = match op {
+            lj::ISLT => Ins::Cmp { op: CmpOp::Lt, expect: true, l: Rk::R(a), r: r(d) },
+            lj::ISGE => Ins::Cmp { op: CmpOp::Lt, expect: false, l: Rk::R(a), r: r(d) },
+            lj::ISLE => Ins::Cmp { op: CmpOp::Le, expect: true, l: Rk::R(a), r: r(d) },
+            lj::ISGT => Ins::Cmp { op: CmpOp::Le, expect: false, l: Rk::R(a), r: r(d) },
+            lj::ISEQV | lj::ISNEV => Ins::Cmp { op: CmpOp::Eq, expect: op == lj::ISEQV, l: Rk::R(a), r: r(d) },
+            lj::ISEQS | lj::ISNES => Ins::Cmp { op: CmpOp::Eq, expect: op == lj::ISEQS, l: Rk::R(a), r: Rk::K(d) },
+            lj::ISEQN | lj::ISNEN => Ins::Cmp { op: CmpOp::Eq, expect: op == lj::ISEQN, l: Rk::R(a), r: Rk::K(nk + d) },
+            lj::ISEQP | lj::ISNEP => Ins::Cmp { op: CmpOp::Eq, expect: op == lj::ISEQP, l: Rk::R(a), r: pri(d) },
+            lj::ISTC | lj::ISFC => Ins::TestSet { a, b: d as Reg, expect: op == lj::ISTC },
+            lj::IST | lj::ISF => Ins::Test { a: d as Reg, expect: op == lj::IST },
+            // Type assertions only found in internal bytecode.
+            lj::ISTYPE | lj::ISNUM => Ins::Data,
+            lj::MOV => Ins::Move { a, b: d as Reg },
+            lj::NOT => Ins::Unary { a, op: UnOp::Not, b: d as Reg },
+            lj::UNM => Ins::Unary { a, op: UnOp::Neg, b: d as Reg },
+            lj::LEN => Ins::Unary { a, op: UnOp::Len, b: d as Reg },
+            lj::ADDVN..=lj::MODVN => Ins::Arith { a, op: arith(op - lj::ADDVN), l: r(b), r: Rk::K(nk + c) },
+            lj::ADDNV..=lj::MODNV => Ins::Arith { a, op: arith(op - lj::ADDNV), l: Rk::K(nk + c), r: r(b) },
+            lj::ADDVV..=lj::MODVV => Ins::Arith { a, op: arith(op - lj::ADDVV), l: r(b), r: r(c) },
+            lj::POW => Ins::Arith { a, op: BinOp::Pow, l: r(b), r: r(c) },
+            lj::CAT => Ins::Concat { a, b: b as Reg, c: c as Reg },
+            lj::KSTR | lj::KCDATA => Ins::LoadK { a, k: d },
+            lj::KSHORT => Ins::LoadImm { a, v: Rk::Int(d as u16 as i16 as i64) },
+            lj::KNUM => Ins::LoadK { a, k: nk + d },
+            lj::KPRI => match d {
+                0 => Ins::LoadNil { a, last: a },
+                _ => Ins::LoadBool { a, val: d == 2, skip: false },
+            },
+            lj::KNIL => Ins::LoadNil { a, last: (d as Reg).max(a) },
+            lj::UGET => Ins::GetUpval { a, up: d as u16 },
+            lj::USETV => Ins::SetUpval { up: a, val: r(d) },
+            lj::USETS => Ins::SetUpval { up: a, val: Rk::K(d) },
+            lj::USETN => Ins::SetUpval { up: a, val: Rk::K(nk + d) },
+            lj::USETP => Ins::SetUpval { up: a, val: pri(d) },
+            lj::UCLO => Ins::Jmp { target: jt, close: Some(a) },
+            lj::FNEW => {
+                let idx = match proto.constants.get(d as usize) {
+                    Some(disassembler::LuaConstant::Proto(p)) => *p,
+                    _ => usize::MAX,
+                };
+                let caps = proto.p.get(idx).map_or(Vec::new(), |p| {
+                    p.upvalue_infos.iter().map(|u| {
+                        if u.on_stack { Cap::Reg(u.idx as Reg) } else { Cap::Up(u.idx as u16) }
+                    }).collect()
+                });
+                Ins::Closure { a, idx, caps }
+            }
+            lj::TNEW => Ins::NewTable { a },
+            lj::TDUP => Ins::DupTable { a, k: d },
+            lj::GGET => Ins::GetGlobal { a, k: d },
+            lj::GSET => Ins::SetGlobal { a, k: d },
+            lj::TGETV | lj::TGETR => Ins::GetTable { a, t: b as Reg, key: r(c) },
+            lj::TGETS => Ins::GetTable { a, t: b as Reg, key: Rk::K(c) },
+            lj::TGETB => Ins::GetTable { a, t: b as Reg, key: Rk::Int(c as i64) },
+            lj::TSETV | lj::TSETR => Ins::SetTable { t: b as Reg, key: r(c), val: Rk::R(a) },
+            lj::TSETS => Ins::SetTable { t: b as Reg, key: Rk::K(c), val: Rk::R(a) },
+            lj::TSETB => Ins::SetTable { t: b as Reg, key: Rk::Int(c as i64), val: Rk::R(a) },
+            // (A-1)[first..] := A.. up to top.
+            lj::TSETM => Ins::SetList { a: a.wrapping_sub(1), src: a, n: None, first: lj::tsetm_first(proto, d) },
+            lj::CALLM => Ins::Call { a, args: a + arg0, nargs: None, nret: opt(b) },
+            lj::CALL => Ins::Call { a, args: a + arg0, nargs: opt(c), nret: opt(b) },
+            lj::CALLMT => Ins::TailCall { a, args: a + arg0, nargs: None },
+            lj::CALLT => Ins::TailCall { a, args: a + arg0, nargs: opt(d) },
+            // R(A).. := R(A-3)(R(A-2), R(A-1)); ITERN is the pairs/next
+            // specialisation with the same effect.
+            lj::ITERC | lj::ITERN => Ins::TForCall { a: a.wrapping_sub(3), nvars: (b.max(2) - 1) as u16, base: 3, ctl: 2 },
+            lj::VARG => Ins::VarArg { a, n: opt(b) },
+            lj::ISNEXT | lj::JMP => Ins::Jmp { target: jt, close: None },
+            lj::RETM => Ins::Return { a, n: None },
+            lj::RET | lj::RET0 | lj::RET1 => Ins::Return { a, n: opt(d) },
+            // FORI enters the body or jumps past FORL; modelled (as for 5.4)
+            // as a jump to FORL, which tests and loops.
+            lj::FORI | lj::JFORI => Ins::ForPrep { a, target: jt.wrapping_sub(1), init: [a, a + 1, a + 2] },
+            lj::FORL | lj::IFORL => Ins::ForLoop { a, var: a + 3, target: jt },
+            lj::ITERL | lj::IITERL => Ins::TForLoop { a: a.wrapping_sub(1), src: a, target: jt },
+            // Loop hints for the JIT.
+            lj::LOOP | lj::ILOOP => Ins::Data,
+            lj::BNOT => Ins::Unary { a, op: UnOp::BNot, b: d as Reg },
+            lj::BAND..=lj::BSHR => {
+                let bop = [BinOp::BAnd, BinOp::BOr, BinOp::BXor, BinOp::Shl, BinOp::Shr][(op - lj::BAND) as usize].clone();
+                Ins::Arith { a, op: bop, l: r(b), r: r(c) }
+            }
+            // `>>>` has no AST operator; lifted as `bit.arshift`.
+            lj::BSAR => Ins::Arith { a, op: BinOp::IDiv, l: r(b), r: r(c) },
+            _ => Ins::Unknown,
+        };
+        if matches!(ins[pc], Ins::Data) { data[pc] = true; }
     }
     finish(ins, data)
 }

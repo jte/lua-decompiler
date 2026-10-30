@@ -18,6 +18,10 @@ entirely in your browser via WebAssembly; files are never uploaded.
   templates; opcodes scrambled by the Roblox client are recognised and
   decoded.  Luau has no `goto`, so code that cannot be structured becomes a
   `while` loop over a state variable instead
+- Decompiles **LuaJIT** 2.0 and 2.1 bytecode (`luajit -b`, `string.dump`),
+  32- and 64-bit: method calls, `goto`, table templates, FFI literals
+  (`1LL`, `2ULL`, `3i`); bit operator instructions come back as `bit.*`
+  calls
 - Output is meant to behave exactly like the bytecode; unstructurable
   (irreducible) control flow falls back to `goto`
 - **Deobfuscation** passes that only rewrite what they can prove equivalent:
@@ -30,7 +34,7 @@ entirely in your browser via WebAssembly; files are never uploaded.
 - Bytecode disassembler, control-flow-graph export (Graphviz DOT) and an
   interactive bytecode debugger (5.1–5.3)
 
-Not supported yet: LuaJIT bytecode. Decompilation is not perfect —
+Decompilation is not perfect —
 if a file produces wrong output, please
 [open an issue](https://github.com/jte/lua-decompiler/issues/new).
 

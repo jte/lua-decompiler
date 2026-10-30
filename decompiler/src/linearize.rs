@@ -486,9 +486,10 @@ pub fn linearize(proto: &Proto) -> Proto {
 /// Recursively linearize `proto` and all of its sub-protos, applying the
 /// linearization pass only where spaghetti is detected.
 pub fn linearize_tree(proto: &Proto) -> Proto {
-    // The relay patterns are those of 5.1–5.3 obfuscators; 5.4 code is left
-    // as is (the decompiler does not depend on code layout).
-    if proto.version >= 0x54 || proto.luau {
+    // The relay patterns are those of 5.1–5.3 obfuscators; 5.4, Luau and
+    // LuaJIT code is left as is (the decompiler does not depend on code
+    // layout).
+    if proto.version >= 0x54 || proto.luau || proto.jit > 0 {
         return proto.clone();
     }
     if has_spaghetti(proto) {

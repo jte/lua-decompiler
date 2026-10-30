@@ -294,6 +294,9 @@ pub struct VarFacts {
     pub pinned: Vec<bool>,
     /// Holds all results of a call / `...` (multret).
     pub pack: Vec<bool>,
+    /// LuaJIT: constructors store positional items with constant integer
+    /// keys (TSETB), so `t[n] = x` for the next position is `{..., x}`.
+    pub positional_keys: bool,
 }
 
 impl VarFacts {
@@ -439,6 +442,46 @@ pub fn fold_block(b: &mut IrBlock, facts: &mut VarFacts) -> bool {
     changed
 }
 
+/// A positional field holding exactly one value (a call or `...` in the
+/// last position would spread).
+fn one_value(e: Expr) -> Expr {
+    match e {
+        Expr::Call { .. } | Expr::Method { .. } | Expr::Vararg => Expr::Paren(Box::new(e)),
+        e => e,
+    }
+}
+
+/// Put `v` into the `k`-th positional field when that is a template `nil`
+/// and only constants follow it (so moving `v` there keeps the order of
+/// evaluation).
+fn fill_hole(fields: &mut [TableField], k: i64, v: &Expr) -> bool {
+    let Some(at) = fields.iter().enumerate()
+        .filter(|(_, f)| matches!(f, TableField::ValueField(_)))
+        .nth(k as usize - 1).map(|(i, _)| i) else { return false };
+    if !matches!(fields[at], TableField::ValueField(Expr::Nil)) { return false; }
+    let constant = |e: &Expr| matches!(e, Expr::Nil | Expr::True | Expr::False | Expr::Integer(_) | Expr::Float(_) | Expr::Str(_));
+    let rest_const = fields[at + 1..].iter().all(|f| match f {
+        TableField::ValueField(e) | TableField::NameField(_, e) => constant(e),
+        TableField::IndexField(k, e) => constant(k) && constant(e),
+    });
+    if !rest_const { return false; }
+    fields[at] = TableField::ValueField(one_value(v.clone()));
+    true
+}
+
+/// `(f())` is only needed as the last positional field.
+fn unwrap_inner_values(fields: &mut [TableField]) {
+    let last = fields.iter().rposition(|f| matches!(f, TableField::ValueField(_)));
+    for (i, f) in fields.iter_mut().enumerate() {
+        if Some(i) == last { continue; }
+        if let TableField::ValueField(Expr::Paren(inner)) = f {
+            if matches!(inner.as_ref(), Expr::Call { .. } | Expr::Method { .. } | Expr::Vararg) {
+                *f = TableField::ValueField(std::mem::replace(inner.as_mut(), Expr::Nil));
+            }
+        }
+    }
+}
+
 /// Rebuild `T = {}` + field assignments + SETLISTs into one constructor.
 /// Works from the end of the block so nested constructors are built first.
 pub fn build_constructors(b: &mut IrBlock, facts: &mut VarFacts) -> bool {
@@ -470,7 +513,17 @@ pub fn build_constructors(b: &mut IrBlock, facts: &mut VarFacts) -> bool {
                         if var_id(table) == Some(t) && !refs_t(key) && !refs_t(&rhs[0])
                             && !pending.iter().any(|&p| count_var(key, p) + count_var(&rhs[0], p) > 0)
                         {
-                            fields.push(field(key.as_ref().clone(), rhs[0].clone()));
+                            let k = key.as_integer().filter(|_| facts.positional_keys && pending.is_empty());
+                            match k {
+                                Some(k) if k > npos && k <= npos + 4 => {
+                                    // The next position (after a short run of nils).
+                                    for _ in npos + 1..k { fields.push(TableField::ValueField(Expr::Nil)); }
+                                    fields.push(TableField::ValueField(one_value(rhs[0].clone())));
+                                    npos = k;
+                                }
+                                Some(k) if k >= 1 && k <= npos && fill_hole(&mut fields, k, &rhs[0]) => {}
+                                _ => fields.push(field(key.as_ref().clone(), rhs[0].clone())),
+                            }
                             t_uses += 1;
                             if pending.is_empty() { good = Some((fields.clone(), j, folded.clone(), t_uses)); }
                             j += 1;
@@ -507,7 +560,8 @@ pub fn build_constructors(b: &mut IrBlock, facts: &mut VarFacts) -> bool {
                 _ => break,
             }
         }
-        if let Some((fields, last, folded, used)) = good {
+        if let Some((mut fields, last, folded, used)) = good {
+            if facts.positional_keys { unwrap_inner_values(&mut fields); }
             b.stmts[i] = Stat::Assign { lhs: vec![var(t)], rhs: vec![Expr::Table(fields)] };
             b.stmts.drain(i + 1..=last);
             for p in folded { facts.defs[p] = 0; facts.uses[p] = 0; }

@@ -110,7 +110,10 @@ function describeHeader(bytes) {
     return { ok: true, text: `${name} bytecode` };
   }
   if (sig.startsWith("\x1bLJ")) {
-    return { ok: false, text: "LuaJIT bytecode is not supported" };
+    // Dump format 1 is LuaJIT 2.0, 2 is LuaJIT 2.1.
+    const v = bytes[3];
+    if (v === 1 || v === 2) return { ok: true, text: `LuaJIT 2.${v - 1} bytecode` };
+    return { ok: false, text: `LuaJIT bytecode format ${v} (only 2.0 and 2.1 are supported)` };
   }
   // Luau (Roblox) bytecode starts with its format version; 0 means the file
   // holds a compile error instead.

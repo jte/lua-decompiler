@@ -28,7 +28,7 @@ pub fn parse(data: &[u8]) -> Result<Proto, String> {
     };
 
     let parsed = parsed_result?;
-    disassembler::set_lua_version(parsed.header.lua_version);
+    disassembler::set_header(&parsed.header);
     let mut proto = Proto::from(parsed.main_chunk);
     if proto.luau && luau_opcodes_encoded(&proto) {
         decode_luau_opcodes(&mut proto);
@@ -70,7 +70,7 @@ pub fn process(data: &[u8], mode: Mode, flatten: bool) -> Result<String, String>
 pub fn run(proto: &Proto, mode: Mode, flatten: bool) -> String {
     match mode {
         Mode::Disassemble => luadec_disassemble_str(proto, 0, Some("0")),
-        Mode::Cfg if proto.version >= 0x54 || proto.luau => decompiler::flow_dot(proto),
+        Mode::Cfg if proto.version >= 0x54 || proto.luau || proto.jit > 0 => decompiler::flow_dot(proto),
         Mode::Cfg => decompiler::cfg::Cfg::build(proto).to_dot(),
         Mode::Decompile if flatten => decompiler::decompile_cff(proto),
         Mode::Decompile => decompiler::decompile(proto),
@@ -298,6 +298,75 @@ mod tests {
     fn codes(p: &Proto, out: &mut Vec<Vec<u32>>) {
         out.push(p.code.clone());
         for c in &p.p { codes(c, out); }
+    }
+
+    /// LuaJIT 2.1 (32-bit, so without FR2), `string.dump(f, true)` of:
+    /// local t = { 1, 2, k = "v" }
+    /// local o = { n = 0 }
+    /// function o:add(x) self.n = self.n + x return self end
+    /// for i = 1, 3 do
+    ///   if i == 2 then goto skip end
+    ///   o:add(i)
+    ///   ::skip::
+    /// end
+    /// print(o.n, #t, t.k, 5LL)
+    const LUAJIT: &[u8] = &[
+        0x1b, 0x4c, 0x4a, 0x02, 0x06, 0x19, 0x00, 0x02, 0x03, 0x00, 0x01, 0x00, 0x04, 0x39, 0x02, 0x00,
+        0x00, 0x20, 0x02, 0x01, 0x02, 0x3d, 0x02, 0x00, 0x00, 0x4c, 0x00, 0x02, 0x00, 0x06, 0x6e, 0x89,
+        0x01, 0x07, 0x00, 0x09, 0x00, 0x08, 0x01, 0x17, 0x35, 0x00, 0x00, 0x00, 0x35, 0x01, 0x01, 0x00,
+        0x33, 0x02, 0x03, 0x00, 0x3d, 0x02, 0x02, 0x01, 0x29, 0x02, 0x01, 0x00, 0x29, 0x03, 0x03, 0x00,
+        0x29, 0x04, 0x01, 0x00, 0x4d, 0x02, 0x08, 0x80, 0x09, 0x05, 0x00, 0x00, 0x58, 0x06, 0x01, 0x80,
+        0x58, 0x06, 0x04, 0x80, 0x12, 0x07, 0x01, 0x00, 0x39, 0x06, 0x02, 0x01, 0x12, 0x08, 0x05, 0x00,
+        0x42, 0x06, 0x03, 0x01, 0x4f, 0x02, 0xf8, 0x7f, 0x36, 0x02, 0x04, 0x00, 0x39, 0x03, 0x05, 0x01,
+        0x15, 0x04, 0x00, 0x00, 0x39, 0x05, 0x06, 0x00, 0x28, 0x06, 0x07, 0x00, 0x42, 0x02, 0x05, 0x01,
+        0x4b, 0x00, 0x01, 0x00, 0x02, 0x05, 0x00, 0x06, 0x6b, 0x06, 0x6e, 0x0a, 0x70, 0x72, 0x69, 0x6e,
+        0x74, 0x00, 0x08, 0x61, 0x64, 0x64, 0x01, 0x00, 0x01, 0x06, 0x6e, 0x03, 0x00, 0x01, 0x03, 0x01,
+        0x00, 0x03, 0x01, 0x03, 0x02, 0x06, 0x6b, 0x06, 0x76, 0x04, 0x00,
+    ];
+
+    /// The same code in LuaJIT 2.0's opcode numbering (the dump format is
+    /// otherwise identical).
+    fn to_luajit20(p: &mut Proto) {
+        use disassembler::luajit as lj;
+        for w in p.code.iter_mut() {
+            let op = *w & 0xFF;
+            let old = match op {
+                0..=15 => op,
+                lj::MOV..=lj::TGETB => op - 2,
+                lj::TSETV..=lj::TSETM => op - 3,
+                lj::CALLM..=lj::JMP => op - 4,
+                _ => panic!("{} is not in LuaJIT 2.0", lj::op_name(op)),
+            };
+            assert_eq!(lj::canon_op(1, old), op);
+            *w = (*w & !0xFF) | old;
+        }
+        p.jit = 1;
+        for c in p.p.iter_mut() { to_luajit20(c); }
+    }
+
+    #[test]
+    fn luajit_bytecode() {
+        let p = parse(LUAJIT).unwrap();
+        assert_eq!((p.jit, p.jit_arg_offset()), (2, 1));
+        let text = run(&p, Mode::Decompile, false);
+        // Stripped, so locals get generated names.
+        for want in [":add(", "5LL", "k = \"v\"", "print(", "for "] {
+            assert!(text.contains(want), "{want} missing:\n{text}");
+        }
+        let mut p20 = p.clone();
+        to_luajit20(&mut p20);
+        assert_eq!(run(&p20, Mode::Decompile, false), text);
+        assert!(run(&p, Mode::Disassemble, false).contains("FORI"));
+
+        // Newer LuaJIT 2.1 bit operator instructions (same operands as
+        // ADDVV): `self.n + x` becomes `self.n >>> x` (parameters are
+        // unnamed in the stripped dump).
+        use disassembler::luajit as lj;
+        let mut pb = p.clone();
+        let add = pb.p[0].code.iter_mut().find(|w| **w & 0xFF == lj::ADDVV).unwrap();
+        *add = (*add & !0xFF) | lj::BSAR;
+        let text = run(&pb, Mode::Decompile, false);
+        assert!(text.contains("_p0.n = bit.arshift(_p0.n, _p1)"), "{text}");
     }
 
     #[test]
