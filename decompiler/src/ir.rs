@@ -13,11 +13,15 @@ use lua_ast::{BinOp, UnOp};
 
 pub type Reg = u16;
 
-/// A register-or-constant operand.
+/// A register, constant or immediate operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rk {
     R(Reg),
     K(u32),
+    /// 5.4 immediate integer.
+    Int(i64),
+    /// 5.4 immediate float (bits of an `f64`).
+    Flt(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +44,8 @@ pub enum Cap {
 pub enum Ins {
     Move { a: Reg, b: Reg },
     LoadK { a: Reg, k: u32 },
+    /// 5.4 LOADI / LOADF.
+    LoadImm { a: Reg, v: Rk },
     LoadBool { a: Reg, val: bool, skip: bool },
     /// Registers `a..=last` := nil.
     LoadNil { a: Reg, last: Reg },
@@ -70,16 +76,20 @@ pub enum Ins {
     Return { a: Reg, n: Option<u16> },
     ForPrep { a: Reg, target: usize },
     ForLoop { a: Reg, target: usize },
-    /// 5.2/5.3 TFORCALL: R(a+3..a+2+nvars) := R(a)(R(a+1), R(a+2)).
-    TForCall { a: Reg, nvars: u16 },
-    /// 5.2/5.3 TFORLOOP (`a` is the control register, i.e. TFORCALL's a+2).
-    TForLoop { a: Reg, target: usize },
+    /// 5.2+ TFORCALL: R(a+base..) := R(a)(R(a+1), R(a+2)), `nvars` results;
+    /// `base` is 3, or 4 in 5.4 (R(a+3) holds the closing value).
+    TForCall { a: Reg, nvars: u16, base: u16 },
+    /// 5.2+ TFORLOOP: if R(src) ~= nil then R(a) := R(src) and jump.  `a`
+    /// is the control register (TFORCALL's a+2), `src` the first variable.
+    TForLoop { a: Reg, src: Reg, target: usize },
     /// 5.1 TFORLOOP: call + test; skips the next instruction (the back JMP)
     /// when the loop ends.
     TForLoop51 { a: Reg, nvars: u16 },
     /// `n`: `None` = up to top.  `first` is the 1-based index of the first item.
     SetList { a: Reg, n: Option<u16>, first: u64 },
     Close { a: Reg },
+    /// 5.4 TBC: R(a) becomes a to-be-closed variable.
+    Tbc { a: Reg },
     Closure { a: Reg, idx: usize, caps: Vec<Cap> },
     /// `n`: `None` = all varargs.
     VarArg { a: Reg, n: Option<u16> },
@@ -106,6 +116,7 @@ fn target(pc: usize, sbx: i32) -> usize {
 }
 
 pub fn decode(proto: &Proto) -> Decoded {
+    if proto.version >= 0x54 { return decode54(proto); }
     let v51 = proto.version == 0x51;
     let code = &proto.code;
     let n = code.len();
@@ -197,10 +208,10 @@ pub fn decode(proto: &Proto) -> Decoded {
                 if v51 {
                     Ins::TForLoop51 { a, nvars: c.max(1) as u16 }
                 } else {
-                    Ins::TForCall { a, nvars: c.max(1) as u16 }
+                    Ins::TForCall { a, nvars: c.max(1) as u16, base: 3 }
                 }
             }
-            OpCode::TForLoop => Ins::TForLoop { a, target: target(pc, sbx) },
+            OpCode::TForLoop => Ins::TForLoop { a, src: a + 1, target: target(pc, sbx) },
             OpCode::SetList => {
                 let block = if c == 0 {
                     if pc + 1 < n { data[pc + 1] = true; }
@@ -245,6 +256,11 @@ pub fn decode(proto: &Proto) -> Decoded {
         pc += 1;
     }
 
+    finish(ins, data)
+}
+
+fn finish(mut ins: Vec<Ins>, data: Vec<bool>) -> Decoded {
+    let n = ins.len();
     for pc in 0..n {
         if data[pc] { ins[pc] = Ins::Data; }
     }
@@ -255,6 +271,171 @@ pub fn decode(proto: &Proto) -> Decoded {
         next[pc] = q;
     }
     Decoded { ins, next }
+}
+
+/// Lua 5.4 tag-method events (ltm.h), as used by MMBIN*.
+fn tm_binop(ev: u32) -> Option<BinOp> {
+    Some(match ev {
+        6 => BinOp::Add, 7 => BinOp::Sub, 8 => BinOp::Mul, 9 => BinOp::Mod,
+        10 => BinOp::Pow, 11 => BinOp::Div, 12 => BinOp::IDiv, 13 => BinOp::BAnd,
+        14 => BinOp::BOr, 15 => BinOp::BXor, 16 => BinOp::Shl, 17 => BinOp::Shr,
+        _ => return None,
+    })
+}
+
+/// Lua 5.4 (lopcodes.h): 7-bit opcode, A 8, k 1, B 8, C 8; Bx 17; sJ 25.
+fn decode54(proto: &Proto) -> Decoded {
+    const OFFSET_SC: i64 = 127;
+    const OFFSET_SBX: i64 = 65535;
+    const OFFSET_SJ: i64 = 16_777_215;
+    let code = &proto.code;
+    let n = code.len();
+    let mut ins: Vec<Ins> = vec![Ins::Unknown; n];
+    let mut data = vec![false; n];
+    let op_of = |i: u32| i & 0x7F;
+    let a_of = |i: u32| ((i >> 7) & 0xFF) as Reg;
+    let k_of = |i: u32| (i >> 15) & 1 != 0;
+    let b_of = |i: u32| (i >> 16) & 0xFF;
+    let c_of = |i: u32| (i >> 24) & 0xFF;
+    let sc = |v: u32| v as i64 - OFFSET_SC;
+    let to = |pc: usize, off: i64| {
+        let t = pc as i64 + 1 + off;
+        if t < 0 { usize::MAX } else { t as usize }
+    };
+    let rkc = |i: u32| if k_of(i) { Rk::K(c_of(i)) } else { Rk::R(c_of(i) as Reg) };
+    // Immediate of EQI & co.: C says whether it stands for a float.
+    let imm = |i: u32| {
+        let v = sc(b_of(i));
+        if c_of(i) != 0 { Rk::Flt((v as f64).to_bits()) } else { Rk::Int(v) }
+    };
+
+    for pc in 0..n {
+        if data[pc] { continue; }
+        let i = code[pc];
+        let (a, b, c, k) = (a_of(i), b_of(i), c_of(i), k_of(i));
+        let bx = i >> 15;
+        let sbx = bx as i64 - OFFSET_SBX;
+        let opt = |v: u32| if v == 0 { None } else { Some((v - 1) as u16) };
+        // The EXTRAARG word after `pc` (its Ax).
+        let extra = |data: &mut Vec<bool>| -> u32 {
+            if pc + 1 < n { data[pc + 1] = true; }
+            code.get(pc + 1).map_or(0, |&w| w >> 7)
+        };
+        // An arithmetic op is followed by its MMBIN* fallback, which names
+        // the source operator and operand order (`x - 1` is ADDI x -1).
+        let arith = |op: BinOp, l: Rk, r: Rk, data: &mut Vec<bool>| -> Ins {
+            if let Some(&w) = code.get(pc + 1) {
+                let (mop, ma, mb, mc, mk) = (op_of(w), a_of(w), b_of(w), c_of(w), k_of(w));
+                let ev = tm_binop(mc);
+                let found = match mop {
+                    46 => ev.map(|o| (o, Rk::R(ma), Rk::R(mb as Reg))),
+                    47 => ev.map(|o| {
+                        let x = Rk::Int(sc(mb));
+                        if mk { (o, x, Rk::R(ma)) } else { (o, Rk::R(ma), x) }
+                    }),
+                    48 => ev.map(|o| {
+                        let x = Rk::K(mb);
+                        if mk { (o, x, Rk::R(ma)) } else { (o, Rk::R(ma), x) }
+                    }),
+                    _ => None,
+                };
+                if let Some((o, l, r)) = found {
+                    data[pc + 1] = true;
+                    return Ins::Arith { a, op: o, l, r };
+                }
+            }
+            Ins::Arith { a, op, l, r }
+        };
+        ins[pc] = match op_of(i) {
+            0 => Ins::Move { a, b: b as Reg },
+            1 => Ins::LoadImm { a, v: Rk::Int(sbx) },
+            2 => Ins::LoadImm { a, v: Rk::Flt((sbx as f64).to_bits()) },
+            3 => Ins::LoadK { a, k: bx },
+            4 => Ins::LoadK { a, k: extra(&mut data) },
+            5 => Ins::LoadBool { a, val: false, skip: false },
+            6 => Ins::LoadBool { a, val: false, skip: true },
+            7 => Ins::LoadBool { a, val: true, skip: false },
+            8 => Ins::LoadNil { a, last: a + b as Reg },
+            9 => Ins::GetUpval { a, up: b as u16 },
+            10 => Ins::SetUpval { a, up: b as u16 },
+            11 => Ins::GetTabUp { a, up: b as u16, key: Rk::K(c) },
+            12 => Ins::GetTable { a, t: b as Reg, key: Rk::R(c as Reg) },
+            13 => Ins::GetTable { a, t: b as Reg, key: Rk::Int(c as i64) },
+            14 => Ins::GetTable { a, t: b as Reg, key: Rk::K(c) },
+            15 => Ins::SetTabUp { up: a as u16, key: Rk::K(b), val: rkc(i) },
+            16 => Ins::SetTable { t: a, key: Rk::R(b as Reg), val: rkc(i) },
+            17 => Ins::SetTable { t: a, key: Rk::Int(b as i64), val: rkc(i) },
+            18 => Ins::SetTable { t: a, key: Rk::K(b), val: rkc(i) },
+            19 => { extra(&mut data); Ins::NewTable { a } }
+            20 => Ins::SelfOp { a, obj: b as Reg, key: rkc(i) },
+            21 => arith(BinOp::Add, Rk::R(b as Reg), Rk::Int(sc(c)), &mut data),
+            22..=31 => {
+                let op = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Mod, BinOp::Pow, BinOp::Div,
+                          BinOp::IDiv, BinOp::BAnd, BinOp::BOr, BinOp::BXor][(op_of(i) - 22) as usize].clone();
+                arith(op, Rk::R(b as Reg), Rk::K(c), &mut data)
+            }
+            32 => arith(BinOp::Shr, Rk::R(b as Reg), Rk::Int(sc(c)), &mut data),
+            33 => arith(BinOp::Shl, Rk::Int(sc(c)), Rk::R(b as Reg), &mut data),
+            34..=45 => {
+                let op = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Mod, BinOp::Pow, BinOp::Div,
+                          BinOp::IDiv, BinOp::BAnd, BinOp::BOr, BinOp::BXor, BinOp::Shl, BinOp::Shr][(op_of(i) - 34) as usize].clone();
+                arith(op, Rk::R(b as Reg), Rk::R(c as Reg), &mut data)
+            }
+            // A fallback not right after its arithmetic op.
+            46..=48 => Ins::Data,
+            49 => Ins::Unary { a, op: UnOp::Neg, b: b as Reg },
+            50 => Ins::Unary { a, op: UnOp::BNot, b: b as Reg },
+            51 => Ins::Unary { a, op: UnOp::Not, b: b as Reg },
+            52 => Ins::Unary { a, op: UnOp::Len, b: b as Reg },
+            53 => Ins::Concat { a, b: a, c: (a + b as Reg).saturating_sub(1) },
+            54 => Ins::Close { a },
+            55 => Ins::Tbc { a },
+            56 => Ins::Jmp { target: to(pc, (i >> 7) as i64 - OFFSET_SJ), close: None },
+            57 => Ins::Cmp { op: CmpOp::Eq, expect: k, l: Rk::R(a), r: Rk::R(b as Reg) },
+            58 => Ins::Cmp { op: CmpOp::Lt, expect: k, l: Rk::R(a), r: Rk::R(b as Reg) },
+            59 => Ins::Cmp { op: CmpOp::Le, expect: k, l: Rk::R(a), r: Rk::R(b as Reg) },
+            60 => Ins::Cmp { op: CmpOp::Eq, expect: k, l: Rk::R(a), r: Rk::K(b) },
+            61 => Ins::Cmp { op: CmpOp::Eq, expect: k, l: Rk::R(a), r: imm(i) },
+            62 => Ins::Cmp { op: CmpOp::Lt, expect: k, l: Rk::R(a), r: imm(i) },
+            63 => Ins::Cmp { op: CmpOp::Le, expect: k, l: Rk::R(a), r: imm(i) },
+            64 => Ins::Cmp { op: CmpOp::Lt, expect: k, l: imm(i), r: Rk::R(a) },
+            65 => Ins::Cmp { op: CmpOp::Le, expect: k, l: imm(i), r: Rk::R(a) },
+            66 => Ins::Test { a, expect: k },
+            67 => Ins::TestSet { a, b: b as Reg, expect: k },
+            68 => Ins::Call { a, nargs: opt(b), nret: opt(c) },
+            69 => Ins::TailCall { a, nargs: opt(b) },
+            70 => Ins::Return { a, n: opt(b) },
+            71 => Ins::Return { a: 0, n: Some(0) },
+            72 => Ins::Return { a, n: Some(1) },
+            // FORLOOP jumps back to the body; FORPREP is treated as jumping
+            // to FORLOOP (as in 5.3): same loop, test placed differently.
+            73 => Ins::ForLoop { a, target: to(pc, -(bx as i64)) },
+            74 => Ins::ForPrep { a, target: to(pc, bx as i64) },
+            75 => Ins::Jmp { target: to(pc, bx as i64), close: None },
+            76 => Ins::TForCall { a, nvars: c.max(1) as u16, base: 4 },
+            77 => Ins::TForLoop { a: a + 2, src: a + 4, target: to(pc, -(bx as i64)) },
+            78 => {
+                let mut first = c as u64;
+                if k { first += extra(&mut data) as u64 * 256; }
+                Ins::SetList { a, n: if b == 0 { None } else { Some(b as u16) }, first: first + 1 }
+            }
+            79 => {
+                let idx = bx as usize;
+                let caps = proto.p.get(idx).map_or(Vec::new(), |p| {
+                    p.upvalue_infos.iter().map(|u| {
+                        if u.on_stack { Cap::Reg(u.idx as Reg) } else { Cap::Up(u.idx as u16) }
+                    }).collect()
+                });
+                Ins::Closure { a, idx, caps }
+            }
+            80 => Ins::VarArg { a, n: opt(c) },
+            // VARARGPREP and EXTRAARG carry nothing for the decompiler.
+            81 | 82 => Ins::Data,
+            _ => Ins::Unknown,
+        };
+        if matches!(ins[pc], Ins::Data) { data[pc] = true; }
+    }
+    finish(ins, data)
 }
 
 /// Control-flow successors of the instruction at `pc` (empty for returns).

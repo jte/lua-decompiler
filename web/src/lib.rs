@@ -31,7 +31,7 @@ pub fn run(data: &[u8], mode: &str, flatten: bool) -> Result<String, JsError> {
         other => return Err(JsError::new(&format!("unknown mode {other:?}"))),
     };
     let proto = engine::parse(data).map_err(|e| {
-        JsError::new(&format!("Could not parse this file as Lua 5.1–5.3 bytecode.\n\nParser details:\n{e}"))
+        JsError::new(&format!("Could not parse this file as Lua 5.1–5.4 bytecode.\n\nParser details:\n{e}"))
     })?;
     Ok(engine::run(&proto, mode, flatten))
 }

@@ -8,21 +8,23 @@ entirely in your browser via WebAssembly; files are never uploaded.
 
 ## Features
 
-- Decompiles Lua **5.1, 5.2 and 5.3** bytecode (`luac` output) back to source:
+- Decompiles Lua **5.1, 5.2, 5.3 and 5.4** bytecode (`luac` output) back to source:
   loops, `if`/`elseif`, `and`/`or` expressions, method calls, table
-  constructors, closures; local names come from debug info when present
+  constructors, closures, Lua 5.4 `<close>` variables; local names come
+  from debug info when present
 - Output is meant to behave exactly like the bytecode; unstructurable
   (irreducible) control flow falls back to `goto`
 - **Deobfuscation** passes that only rewrite what they can prove equivalent:
-  noise removal, constant folding and propagation, lookup-table resolution,
-  XOR-cipher string decryption, constant/identity function inlining,
-  dead-code removal, naming of re-bound API functions
-- **Control-flow unflattening** for JMP-spaghetti obfuscators
+  noise removal, opaque predicates and junk loops, constant folding and
+  propagation, lookup-table resolution, string decoding (XOR ciphers and a
+  bounded evaluator for decoder functions), constant/identity function
+  inlining, dead-code removal, naming of re-bound API functions
+- **Control-flow unflattening** for JMP-spaghetti obfuscators (5.1–5.3)
 - Recovers Lua 5.2 files whose debug info was corrupted by obfuscators
 - Bytecode disassembler, control-flow-graph export (Graphviz DOT) and an
-  interactive bytecode debugger
+  interactive bytecode debugger (5.1–5.3)
 
-Not supported yet: Lua 5.4 and LuaJIT bytecode. Decompilation is not perfect —
+Not supported yet: LuaJIT bytecode. Decompilation is not perfect —
 if a file produces wrong output, please
 [open an issue](https://github.com/jte/lua-decompiler/issues/new).
 

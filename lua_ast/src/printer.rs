@@ -37,6 +37,20 @@ impl Printer {
                     }
                 }
             }
+            // `local x = v` + `@tbc(x)` → `local x <close> = v`
+            if let (Stat::Local { names, values }, Some(t)) = (&block[i], block.get(i + 1).and_then(crate::tbc_arg)) {
+                if names.len() == 1 && values.len() == 1 && matches!(t, Expr::Name(n) if *n == names[0]) {
+                    self.write_value(&format!("local {} <close> = ", names[0]), &values[0], "");
+                    i += 2;
+                    continue;
+                }
+            }
+            if let Some(t) = crate::tbc_arg(&block[i]) {
+                let v = self.expr(t);
+                self.line(format!("local _close <close> = {}", v));
+                i += 1;
+                continue;
+            }
             let s = &block[i];
             let last = i + 1 == block.len();
             // `f()` followed by `(x).y = 1` would parse as `f()(x).y = 1`.

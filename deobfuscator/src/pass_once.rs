@@ -52,7 +52,9 @@ pub fn run(block: &mut Block) {
             if let Some(new) = rewrite_loop(b, i, &decls, &writes) {
                 // Keep a block when the iteration declares something, or
                 // returns (`return` must end a block).
-                let scoped = new.iter().any(|s| matches!(s, Stat::Local { .. } | Stat::Label(_) | Stat::Return(_)));
+                let scoped = new.iter().any(|s| {
+                    matches!(s, Stat::Local { .. } | Stat::Label(_) | Stat::Return(_)) || lua_ast::tbc_arg(s).is_some()
+                });
                 let new = if scoped { vec![Stat::Do(new)] } else { new };
                 b.splice(i..=i, new);
             }
@@ -137,7 +139,7 @@ fn simulate(stats: &[Stat], env: &mut Env, out: &mut Vec<Stat>) -> Option<Exit> 
                 }
                 let mut inner = Vec::new();
                 let exit = match chosen { Some(b) => simulate(b, env, &mut inner)?, None => Exit::Fallthrough };
-                if inner.iter().any(|s| matches!(s, Stat::Local { .. })) {
+                if inner.iter().any(|s| matches!(s, Stat::Local { .. }) || lua_ast::tbc_arg(s).is_some()) {
                     out.push(Stat::Do(inner));
                 } else {
                     out.extend(inner);

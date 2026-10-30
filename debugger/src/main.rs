@@ -31,6 +31,10 @@ fn main() {
     };
 
     disassembler::set_lua_version(parsed.header.lua_version);
+    if parsed.header.lua_version >= 0x54 {
+        eprintln!("The debugger supports Lua 5.1-5.3 bytecode; this file is Lua 5.4.");
+        process::exit(1);
+    }
 
     let root = disassembler::Proto::from(parsed.main_chunk);
 

@@ -54,7 +54,7 @@ fn drop_unreachable(b: &mut Block) {
         i += 1;
     }
     if let Some(Stat::Do(inner)) = b.last() {
-        if !inner.iter().any(|s| matches!(s, Stat::Local { .. } | Stat::Label(_))) {
+        if !inner.iter().any(|s| matches!(s, Stat::Local { .. } | Stat::Label(_)) || lua_ast::tbc_arg(s).is_some()) {
             let Some(Stat::Do(inner)) = b.pop() else { unreachable!() };
             b.extend(inner);
         }
@@ -72,7 +72,7 @@ fn falsy(e: &Expr) -> bool {
 /// `B` as statements of the enclosing block.  A `do` keeps locals and labels
 /// scoped, and keeps a trailing `return`/`break` last in its block.
 fn splice(b: Block) -> Vec<Stat> {
-    let needs_do = b.iter().any(|s| matches!(s, Stat::Local { .. } | Stat::Label(_)))
+    let needs_do = b.iter().any(|s| matches!(s, Stat::Local { .. } | Stat::Label(_)) || lua_ast::tbc_arg(s).is_some())
         || matches!(b.last(), Some(Stat::Return(_) | Stat::Break));
     if b.is_empty() { vec![] } else if needs_do { vec![Stat::Do(b)] } else { b }
 }

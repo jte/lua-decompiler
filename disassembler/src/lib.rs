@@ -1,4 +1,6 @@
 pub use luac_parser::{LuaConstant, LuaNumber};
+
+mod lua54;
 use luac_parser::{LuaChunk, UpVal};
 use std::cell::Cell;
 
@@ -260,7 +262,9 @@ pub fn get_opcode(i: u32) -> OpCode {
     match lua_version() {
         0x51 => lua51_opcode(op),
         0x52 => lua52_opcode(op),
-        _    => lua53_opcode(op),
+        0x53 => lua53_opcode(op),
+        // 5.4 has its own layout; see `ir::decode` and `lua54::disassemble_to`.
+        _    => OpCode::Unknown,
     }
 }
 
@@ -313,7 +317,7 @@ pub struct LocVar {
 
 #[derive(Clone)]
 pub struct Proto {
-    /// Lua version byte from the chunk header (0x51, 0x52, 0x53).
+    /// Lua version byte from the chunk header (0x51 .. 0x54).
     pub version: u8,
     pub linedefined: u64,
     pub numparams: u8,
@@ -589,6 +593,9 @@ pub fn luadec_disassemble_str(fwork: &Proto, dflag: i32, name: Option<&str>) -> 
 }
 
 pub fn luadec_disassemble_to(fwork: &Proto, dflag: i32, name: Option<&str>, out: &mut dyn std::io::Write) {
+    if fwork.version >= 0x54 {
+        return lua54::disassemble_to(fwork, name, out);
+    }
     let f = fwork;
     let mut ignore_next = 0usize;
 

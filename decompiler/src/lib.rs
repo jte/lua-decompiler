@@ -86,6 +86,36 @@ pub fn decompile_cff(proto: &Proto) -> String {
     print_block(&decompile_cff_to_block(proto), 0)
 }
 
+/// Graphviz DOT of `proto`'s control-flow graph as the decompiler sees it
+/// (every Lua version; [`cfg::Cfg`] covers 5.1–5.3 only).
+pub fn flow_dot(proto: &Proto) -> String {
+    let d = ir::decode(proto);
+    let flow = Flow::build(&d);
+    let mut s = String::from("digraph {\n");
+    for (id, n) in flow.nodes.iter().enumerate() {
+        let pcs: Vec<usize> = n.ops.iter().filter_map(|o| if let flow::Op::Pc(p) = o { Some(*p) } else { None }).collect();
+        let range = match (pcs.first(), pcs.last()) {
+            (Some(a), Some(b)) => format!("pc {}..{}", a, b),
+            _ => "(no code)".to_string(),
+        };
+        s.push_str(&format!("    {} [ label=\"BB{}\\n{}\", shape=box ]\n", id, id, range));
+    }
+    for (id, n) in flow.nodes.iter().enumerate() {
+        for (k, t) in n.succs.iter().enumerate() {
+            let label = match (&n.term, k) {
+                (Term::Cond { .. }, 0) => "true",
+                (Term::Cond { .. }, _) => "false",
+                (Term::NumFor { .. } | Term::GenFor { .. }, 0) => "body",
+                (Term::NumFor { .. } | Term::GenFor { .. }, _) => "exit",
+                _ => "",
+            };
+            s.push_str(&format!("    {} -> {} [ label=\"{}\" ]\n", id, t, label));
+        }
+    }
+    s.push_str("}\n");
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
@@ -322,6 +352,7 @@ fn decompile_fn(
     env_to_globals(&mut body, &ctx.globals);
     materialize_packs(&mut body, &facts.pack, proto.version);
     astpass::raise_generic_for(&mut body);
+    astpass::scope_tbc(&mut body);
 
     // Declarations and names.
     let params: Vec<VarId> = an.param_vars.clone();

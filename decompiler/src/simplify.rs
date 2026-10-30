@@ -123,7 +123,7 @@ pub fn fold_forgen(b: &mut IrBlock, facts: &mut VarFacts) -> bool {
     let Stat::Call(init) = &b.stmts[n - 1] else { return false };
     let Some(args) = pseudo_args(init, "@forgen") else { return false };
     let Stat::Assign { lhs, rhs } = &b.stmts[n - 2] else { return false };
-    if rhs.len() != 1 || !is_multi(&rhs[0]) || lhs.len() < 2 || lhs.len() > 3 { return false; }
+    if rhs.len() != 1 || !is_multi(&rhs[0]) || lhs.len() < 2 || lhs.len() > 4 { return false; }
     let vars: Vec<VarId> = lhs.iter().filter_map(var_id).collect();
     if vars.len() != lhs.len() || !vars.iter().all(|&v| facts.foldable(v)) { return false; }
     // The init must read exactly these variables, then (if fewer) nils.

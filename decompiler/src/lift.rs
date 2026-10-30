@@ -286,15 +286,20 @@ impl<'a> Lifter<'a> {
             let uv = |k: usize| var(info.use_var[k]);
             let u = |r: u16| info.use_of(r).map(var).unwrap_or(Expr::Nil);
             let dv = |r: u16| info.def_of(r).map(var).unwrap_or(Expr::Nil);
-            let rk = |x: Rk| match x { Rk::R(r) => u(r), Rk::K(k) => self.k(k) };
+            let rk = |x: Rk| match x {
+                Rk::R(r) => u(r),
+                Rk::K(k) => self.k(k),
+                Rk::Int(v) => Expr::Integer(v),
+                Rk::Flt(bits) => Expr::Float(f64::from_bits(bits)),
+            };
             let assign = |l: Expr, r: Expr| Stat::Assign { lhs: vec![l], rhs: vec![r] };
             match op {
                 Op::Copy { dst, src } => out.stmts.push(assign(dv(dst), u(src))),
                 Op::NumForInit { .. } => {
                     out.stmts.push(Stat::Call(pseudo("@fornum", (0..3).map(uv).collect())));
                 }
-                Op::GenForInit { .. } => {
-                    out.stmts.push(Stat::Call(pseudo("@forgen", (0..3).map(uv).collect())));
+                Op::GenForInit { n, .. } => {
+                    out.stmts.push(Stat::Call(pseudo("@forgen", (0..n as usize).map(uv).collect())));
                 }
                 Op::Pc(pc) => {
                     let ins = &self.d.ins[pc];
@@ -307,7 +312,7 @@ impl<'a> Lifter<'a> {
                             }
                             Ins::Test { a, .. } => u(*a),
                             Ins::TestSet { b, .. } => u(*b),
-                            Ins::TForLoop { a, .. } => ne_nil(u(a + 1)),
+                            Ins::TForLoop { src, .. } => ne_nil(u(*src)),
                             Ins::TForLoop51 { a, nvars } => {
                                 // Lowered: call, then test the first result.
                                 let lhs: Vec<Expr> = (a + 3..a + 3 + nvars).map(dv).collect();
@@ -322,6 +327,16 @@ impl<'a> Lifter<'a> {
                     let s: Option<Stat> = match ins {
                         Ins::Move { a, b } => Some(assign(dv(*a), u(*b))),
                         Ins::LoadK { a, k } => Some(assign(dv(*a), self.k(*k))),
+                        Ins::LoadImm { a, v } => Some(assign(dv(*a), rk(*v))),
+                        // The register is used by `astpass::scope_tbc`, which
+                        // leaves `@tbc(x)` (printed as `local x <close>`).
+                        Ins::Tbc { a } => Some(Stat::Call(pseudo("@tbc", vec![u(*a), Expr::Integer(*a as i64)]))),
+                        // Where a block with to-be-closed variables ends.
+                        Ins::Close { a } if self.proto.version >= 0x54
+                            && self.d.ins.iter().any(|i| matches!(i, Ins::Tbc { .. })) =>
+                        {
+                            Some(Stat::Call(pseudo("@close", vec![Expr::Integer(*a as i64)])))
+                        }
                         Ins::LoadBool { a, val, .. } => Some(assign(dv(*a), if *val { Expr::True } else { Expr::False })),
                         Ins::LoadNil { a, last } => {
                             for r in *a..=*last { out.stmts.push(assign(dv(r), Expr::Nil)); }
@@ -429,8 +444,8 @@ impl<'a> Lifter<'a> {
                                 rhs: vec![Expr::Vararg],
                             }),
                         },
-                        Ins::TForCall { a, nvars } if !matches!(node.term, Term::GenFor { .. }) => {
-                            let lhs: Vec<Expr> = (a + 3..a + 3 + nvars).map(dv).collect();
+                        Ins::TForCall { a, nvars, base } if !matches!(node.term, Term::GenFor { .. }) => {
+                            let lhs: Vec<Expr> = (a + base..a + base + nvars).map(dv).collect();
                             let call = Expr::Call { func: Box::new(u(*a)), args: vec![u(a + 1), u(a + 2)] };
                             Some(Stat::Assign { lhs, rhs: vec![call] })
                         }

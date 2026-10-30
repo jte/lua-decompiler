@@ -15,8 +15,9 @@ pub enum Op {
     Copy { dst: Reg, src: Reg },
     /// Start of a canonical numeric for: consumes R(a), R(a+1), R(a+2).
     NumForInit { a: Reg },
-    /// Start of a canonical generic for: consumes R(a), R(a+1), R(a+2).
-    GenForInit { a: Reg },
+    /// Start of a canonical generic for: consumes R(a)..R(a+n-1) (n = 3, or 4
+    /// in 5.4 with the closing value).
+    GenForInit { a: Reg, n: u16 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,14 +88,15 @@ impl Flow {
 
         // Generic-for headers: TFORCALL immediately followed by its TFORLOOP
         // (5.2/5.3), or a 5.1 TFORLOOP followed by the back JMP.
-        let mut genfor_at: BTreeMap<usize, (Reg, u16, usize, usize)> = BTreeMap::new(); // pc -> (a, nvars, body, exit)
+        // pc -> (a, nvars, body, exit, number of setup registers)
+        let mut genfor_at: BTreeMap<usize, (Reg, u16, usize, usize, u16)> = BTreeMap::new();
         for pc in 0..n {
             match &d.ins[pc] {
-                Ins::TForCall { a, nvars } => {
+                Ins::TForCall { a, nvars, base } => {
                     let q = d.next[pc];
-                    if let Some(Ins::TForLoop { a: la, target }) = d.ins.get(q) {
+                    if let Some(Ins::TForLoop { a: la, target, .. }) = d.ins.get(q) {
                         if *la == a + 2 && *target < n {
-                            genfor_at.insert(pc, (*a, *nvars, *target, d.next[q]));
+                            genfor_at.insert(pc, (*a, *nvars, *target, d.next[q], *base));
                         }
                     }
                 }
@@ -102,7 +104,7 @@ impl Flow {
                     let q = d.next[pc];
                     if let Some(Ins::Jmp { target, .. }) = d.ins.get(q) {
                         if *target < n {
-                            genfor_at.insert(pc, (*a, *nvars, *target, d.next[q]));
+                            genfor_at.insert(pc, (*a, *nvars, *target, d.next[q], 3));
                         }
                     }
                 }
@@ -112,10 +114,13 @@ impl Flow {
 
         // ── Leaders ────────────────────────────────────────────────────────
         let mut leader = vec![false; n];
-        leader[0] = true;
+        // Execution starts at the first real instruction (5.4 functions open
+        // with VARARGPREP, which is data here).
+        let first = (0..n).find(|&pc| !matches!(d.ins[pc], Ins::Data)).unwrap_or(0);
+        leader[first] = true;
         for pc in 0..n {
             if matches!(d.ins[pc], Ins::Data) { continue; }
-            if let Some(&(_, _, body, exit)) = genfor_at.get(&pc) {
+            if let Some(&(_, _, body, exit, _)) = genfor_at.get(&pc) {
                 leader[pc] = true;
                 if body < n { leader[body] = true; }
                 if exit < n { leader[exit] = true; }
@@ -179,7 +184,7 @@ impl Flow {
             };
             // Generic-for header?
             let first_pc = nodes[id].ops.iter().find_map(|o| if let Op::Pc(p) = o { Some(*p) } else { None }).unwrap();
-            if let Some(&(a, nvars, body, exit)) = genfor_at.get(&first_pc) {
+            if let Some(&(a, nvars, body, exit, _)) = genfor_at.get(&first_pc) {
                 nodes[id].term = Term::GenFor { a, nvars, pc: first_pc };
                 nodes[id].succs = [Some(body), Some(exit)].iter().filter_map(|&p| p.and_then(|p| node_of(p))).collect();
                 if nodes[id].succs.len() != 2 { nodes[id].term = Term::Exit; nodes[id].succs.clear(); }
@@ -240,7 +245,7 @@ impl Flow {
                     // `if R(x) ~= nil then R(ctl) = R(x); <continue> end`.
                     let nx = d.next[last];
                     let (cont, stop, dst, src) = match &d.ins[last] {
-                        Ins::TForLoop { a, target } => (*target, nx, *a, *a + 1),
+                        Ins::TForLoop { a, src, target } => (*target, nx, *a, *src),
                         Ins::TForLoop51 { a, .. } => {
                             (nx, if nx < n { d.next[nx] } else { nx }, *a + 2, *a + 3)
                         }
@@ -278,9 +283,9 @@ impl Flow {
                 Ins::Jmp { target, .. } => {
                     // Only the jump right before the body enters the loop;
                     // other jumps to the header are `continue`s.
-                    if let Some(&(a, _, body, _)) = genfor_at.get(target) {
+                    if let Some(&(a, _, body, _, setup)) = genfor_at.get(target) {
                         if d.next[last] == body {
-                            nodes[id].ops.push(Op::GenForInit { a });
+                            nodes[id].ops.push(Op::GenForInit { a, n: setup });
                         }
                     }
                 }
@@ -293,7 +298,7 @@ impl Flow {
             }
         }
 
-        let entry = node_of(0).unwrap_or(0);
+        let entry = node_of(first).unwrap_or(0);
         Flow::finish(nodes, entry)
     }
 

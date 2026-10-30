@@ -225,6 +225,18 @@ pub enum Stat {
 /// A block is a sequence of statements.
 pub type Block = Vec<Stat>;
 
+/// The value of a to-be-closed marker `@tbc(x)`: Lua 5.4's
+/// `local x <close> = ...` is a declaration plus this statement, which
+/// marks `x` to be closed at the end of the enclosing block.  Passes that
+/// move statements across block boundaries must treat it like a `local`.
+pub fn tbc_arg(s: &Stat) -> Option<&Expr> {
+    match s {
+        Stat::Call(Expr::Call { func, args }) if args.len() == 1
+            && matches!(func.as_ref(), Expr::Name(n) if n == "@tbc") => Some(&args[0]),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Printer
 // ---------------------------------------------------------------------------

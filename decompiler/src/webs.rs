@@ -109,10 +109,11 @@ fn uses_defs(
     };
     match op {
         Op::Copy { dst, src } => { u.push(src); df.push(dst); }
-        Op::NumForInit { a } | Op::GenForInit { a } => { u.extend([a, a + 1, a + 2]); }
+        Op::NumForInit { a } => { u.extend([a, a + 1, a + 2]); }
+        Op::GenForInit { a, n } => { u.extend(a..a + n); }
         Op::Pc(pc) => match &d.ins[pc] {
             Ins::Move { a, b } => { u.push(*b); df.push(*a); }
-            Ins::LoadK { a, .. } | Ins::LoadBool { a, .. } | Ins::GetUpval { a, .. }
+            Ins::LoadK { a, .. } | Ins::LoadImm { a, .. } | Ins::LoadBool { a, .. } | Ins::GetUpval { a, .. }
             | Ins::GetGlobal { a, .. } | Ins::NewTable { a } => df.push(*a),
             Ins::LoadNil { a, last } => { for r in *a..=*last { df.push(r); } }
             Ins::GetTabUp { a, key, .. } => { rk_regs(&mut u, *key); df.push(*a); }
@@ -159,11 +160,12 @@ fn uses_defs(
             }
             Ins::ForPrep { .. } => {}
             Ins::ForLoop { a, .. } => df.push(a + 3),
-            Ins::TForCall { a, nvars } => {
+            Ins::TForCall { a, nvars, base } => {
                 if !canon_header { u.extend([*a, a + 1, a + 2]); }
-                for r in a + 3..a + 3 + nvars { df.push(r); }
+                for r in a + base..a + base + nvars { df.push(r); }
             }
-            Ins::TForLoop { a, .. } => { if !canon_header { u.push(a + 1); } }
+            Ins::TForLoop { src, .. } => { if !canon_header { u.push(*src); } }
+            Ins::Tbc { a } => u.push(*a),
             Ins::TForLoop51 { a, nvars } => {
                 // Lowered form tests the R(a+3) it just defined; the lifter
                 // refers to that def directly.

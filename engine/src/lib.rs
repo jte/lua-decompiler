@@ -45,6 +45,7 @@ pub fn process(data: &[u8], mode: Mode, flatten: bool) -> Result<String, String>
 pub fn run(proto: &Proto, mode: Mode, flatten: bool) -> String {
     match mode {
         Mode::Disassemble => luadec_disassemble_str(proto, 0, Some("0")),
+        Mode::Cfg if proto.version >= 0x54 => decompiler::flow_dot(proto),
         Mode::Cfg => decompiler::cfg::Cfg::build(proto).to_dot(),
         Mode::Decompile if flatten => decompiler::decompile_cff(proto),
         Mode::Decompile => decompiler::decompile(proto),

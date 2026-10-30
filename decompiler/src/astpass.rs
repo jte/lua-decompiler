@@ -423,6 +423,54 @@ fn mentions(e: &Expr, t: &Expr) -> bool {
     found
 }
 
+/// Lua 5.4 to-be-closed variables.  `@tbc(x, reg)` is followed, where the
+/// original `do ... end` ended, by `@close(level)` with `level <= reg` in the
+/// same statement list: that range (from x's assignment just before, if any)
+/// becomes `do ... end` again, so x is closed at the same point.  Without
+/// such a `@close` the variable lives to the end of its list's block, as
+/// printed.  Other `@close`s are dropped; `@tbc` keeps only x.
+pub fn scope_tbc(b: &mut Vec<Stat>) {
+    fn tbc(s: &Stat) -> Option<(Expr, i64)> {
+        let Stat::Call(e) = s else { return None };
+        let args = pseudo_args(e, "@tbc")?;
+        Some((args.first()?.clone(), args.get(1)?.as_integer()?))
+    }
+    fn close(s: &Stat) -> Option<i64> {
+        let Stat::Call(e) = s else { return None };
+        pseudo_args(e, "@close")?.first()?.as_integer()
+    }
+    for s in b.iter_mut() {
+        // A `do` that is a whole body ends where the body ends (not so for
+        // `repeat`, whose condition is inside the body's scope).
+        let keep = matches!(s, Stat::Repeat { .. });
+        for_each_child_mut(s, &mut |c| {
+            scope_tbc(c);
+            if !keep && c.len() == 1 && matches!(c[0], Stat::Do(_)) {
+                let Some(Stat::Do(inner)) = c.pop() else { unreachable!() };
+                *c = inner;
+            }
+        });
+    }
+    let mut i = 0;
+    while i < b.len() {
+        if let Some((x, reg)) = tbc(&b[i]) {
+            b[i] = Stat::Call(Expr::Call { func: Box::new(Expr::Name("@tbc".into())), args: vec![x.clone()] });
+            if let Some(j) = (i + 1..b.len()).find(|&j| close(&b[j]).is_some_and(|l| l <= reg)) {
+                let defined = i > 0 && matches!(&b[i - 1], Stat::Assign { lhs, .. } if lhs.len() == 1 && lhs[0] == x);
+                let start = if defined { i - 1 } else { i };
+                let mut inner: Vec<Stat> = b.drain(start..j).collect();
+                b.remove(start); // the `@close`
+                scope_tbc(&mut inner);
+                b.insert(start, Stat::Do(inner));
+                i = start + 1;
+                continue;
+            }
+        }
+        if close(&b[i]).is_some() { b.remove(i); continue; }
+        i += 1;
+    }
+}
+
 /// Turn left-over `@setlist` pseudo-calls into assignments and drop the
 /// implicit final `return`.
 pub fn finalize(b: &mut Vec<Stat>, top: bool) {
@@ -482,7 +530,9 @@ pub fn finalize(b: &mut Vec<Stat>, top: bool) {
         let old = std::mem::take(b);
         for s in old {
             match s {
-                Stat::Do(inner) if !inner.iter().any(|x| matches!(x, Stat::Local { .. })) => b.extend(inner),
+                Stat::Do(inner) if !inner.iter().any(|x| matches!(x, Stat::Local { .. }) || lua_ast::tbc_arg(x).is_some()) => {
+                    b.extend(inner)
+                }
                 other => b.push(other),
             }
         }
