@@ -385,10 +385,43 @@ fn classify(flow: &Flow, blocks: &[IrBlock], l: usize) -> Shape {
     Shape { header: h, kind: Kind::Infinite, follow, cont: h }
 }
 
+/// Luau FORGPREP: a non-function iterator is iterated by its `__iter`
+/// metamethod, or like `next` (the built-in table traversal).
+///
+/// ```lua
+/// if type(f) ~= "function" then
+///   local __mt = getmetatable(f)
+///   if __mt and __mt.__iter then f, s, c = __mt.__iter(f) else f, s, c = next, f, nil end
+/// end
+/// ```
+fn luau_iter_setup([f, s, c]: [Expr; 3]) -> Stat {
+    let name = |n: &str| Expr::Name(n.into());
+    let call = |func: Expr, args: Vec<Expr>| Expr::Call { func: Box::new(func), args };
+    let field = |t: Expr, k: &str| Expr::Index { table: Box::new(t), key: Box::new(Expr::Str(k.as_bytes().to_vec())) };
+    let triple = vec![f.clone(), s, c];
+    let is_fn = Expr::BinOp {
+        op: BinOp::Ne,
+        lhs: Box::new(call(name("type"), vec![f.clone()])),
+        rhs: Box::new(Expr::Str(b"function".to_vec())),
+    };
+    let has_iter = Expr::BinOp { op: BinOp::And, lhs: Box::new(name("__mt")), rhs: Box::new(field(name("__mt"), "__iter")) };
+    Stat::If {
+        branches: vec![(is_fn, vec![
+            Stat::Local { names: vec!["__mt".into()], values: vec![call(name("getmetatable"), vec![f.clone()])] },
+            Stat::If {
+                branches: vec![(has_iter, vec![Stat::Assign { lhs: triple.clone(), rhs: vec![call(field(name("__mt"), "__iter"), vec![f.clone()])] }])],
+                else_body: Some(vec![Stat::Assign { lhs: triple, rhs: vec![name("next"), f, Expr::Nil] }]),
+            },
+        ])],
+        else_body: None,
+    }
+}
+
 /// Fallback for irreducible or unstructurable code: one label per node and
 /// explicit gotos (valid Lua 5.2+).  For loops are lowered to their VM
-/// semantics using hidden variables numbered from `next_var`.
-pub fn flat(flow: &Flow, blocks: &[IrBlock], next_var: &mut usize, boxed: &BTreeSet<VarId>) -> Vec<Stat> {
+/// semantics using hidden variables numbered from `next_var`.  `luau`: a
+/// generic for's iterator may be a table (generalized iteration).
+pub fn flat(flow: &Flow, blocks: &[IrBlock], next_var: &mut usize, boxed: &BTreeSet<VarId>, luau: bool) -> Vec<Stat> {
     let new_box = |e: Expr| Expr::Table(vec![lua_ast::TableField::ValueField(e)]);
     let v = |id: usize| Expr::Name(format!("@v{}", id));
     let bin = |op: BinOp, a: Expr, b: Expr| Expr::BinOp { op, lhs: Box::new(a), rhs: Box::new(b) };
@@ -418,6 +451,8 @@ pub fn flat(flow: &Flow, blocks: &[IrBlock], next_var: &mut usize, boxed: &BTree
                     if numeric {
                         // FORPREP: idx = idx - step
                         out.push(Stat::Assign { lhs: vec![v(h[0])], rhs: vec![bin(BinOp::Sub, v(h[0]), v(h[2]))] });
+                    } else if luau {
+                        out.push(luau_iter_setup([v(h[0]), v(h[1]), v(h[2])]));
                     }
                 }
                 _ => out.push(s.clone()),

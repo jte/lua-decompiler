@@ -22,6 +22,9 @@ pub enum Rk {
     Int(i64),
     /// 5.4 immediate float (bits of an `f64`).
     Flt(u64),
+    /// Luau JUMPXEQKNIL / JUMPXEQKB operands.
+    Nil,
+    Bool(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,11 +34,22 @@ pub enum CmpOp {
     Le,
 }
 
+/// Condition of a Luau conditional jump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchCond {
+    /// R(a) is neither nil nor false.
+    Truthy(Reg),
+    Cmp { op: CmpOp, l: Rk, r: Rk },
+}
+
 /// How a closure captures one upvalue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cap {
     /// A register of the enclosing function.
     Reg(Reg),
+    /// Luau CAPTURE VAL: a copy of the register's current value (for locals
+    /// never assigned again; no upvalue stays open).
+    Val(Reg),
     /// An upvalue of the enclosing function.
     Up(u16),
 }
@@ -74,7 +88,9 @@ pub enum Ins {
     Call { a: Reg, nargs: Option<u16>, nret: Option<u16> },
     TailCall { a: Reg, nargs: Option<u16> },
     Return { a: Reg, n: Option<u16> },
-    ForPrep { a: Reg, target: usize },
+    /// `init`: the registers holding (start, limit, step) — R(a), R(a+1),
+    /// R(a+2) except in Luau (R(a+2), R(a), R(a+1)).
+    ForPrep { a: Reg, target: usize, init: [Reg; 3] },
     /// `var` is the visible loop variable: R(a+3), or R(a+2) in 5.5.
     ForLoop { a: Reg, var: Reg, target: usize },
     /// 5.2+ TFORCALL: R(a+base..) := R(a)(R(a+1), R(a+ctl)), `nvars`
@@ -87,14 +103,24 @@ pub enum Ins {
     /// 5.1 TFORLOOP: call + test; skips the next instruction (the back JMP)
     /// when the loop ends.
     TForLoop51 { a: Reg, nvars: u16 },
-    /// `n`: `None` = up to top.  `first` is the 1-based index of the first item.
-    SetList { a: Reg, n: Option<u16>, first: u64 },
+    /// `n`: `None` = up to top.  `first` is the 1-based index of the first
+    /// item; the items are in `src..` (R(a+1).. except in Luau).
+    SetList { a: Reg, src: Reg, n: Option<u16>, first: u64 },
     Close { a: Reg },
     /// 5.4 TBC: R(a) becomes a to-be-closed variable.
     Tbc { a: Reg },
     /// 5.5 ERRNNIL (`global x = ...`): error unless R(a) is nil; `name` is
     /// the constant holding the global's name.
     ErrNNil { a: Reg, name: Option<u32> },
+    /// Luau conditional jump: to `target` if `cond` holds (does not hold,
+    /// with `negate`), else to the next instruction.
+    Branch { cond: BranchCond, negate: bool, target: usize },
+    /// Luau LOADB with a jump: `a := val`, then continue at `target`.
+    LoadBoolJump { a: Reg, val: bool, target: usize },
+    /// Luau GETIMPORT: `a := name1.name2.name3` (constant string indices).
+    GetImport { a: Reg, path: Vec<u32> },
+    /// Luau DUPTABLE: `a :=` a new table from the constant template `k`.
+    DupTable { a: Reg, k: u32 },
     Closure { a: Reg, idx: usize, caps: Vec<Cap> },
     /// `n`: `None` = all varargs.
     VarArg { a: Reg, n: Option<u16> },
@@ -121,6 +147,7 @@ fn target(pc: usize, sbx: i32) -> usize {
 }
 
 pub fn decode(proto: &Proto) -> Decoded {
+    if proto.luau { return decode_luau(proto); }
     if proto.version >= 0x54 { return decode54(proto); }
     let v51 = proto.version == 0x51;
     let code = &proto.code;
@@ -207,7 +234,7 @@ pub fn decode(proto: &Proto) -> Decoded {
             OpCode::Call => Ins::Call { a, nargs: opt(b), nret: opt(c) },
             OpCode::TailCall => Ins::TailCall { a, nargs: opt(b) },
             OpCode::Return => Ins::Return { a, n: opt(b) },
-            OpCode::ForPrep => Ins::ForPrep { a, target: target(pc, sbx) },
+            OpCode::ForPrep => Ins::ForPrep { a, target: target(pc, sbx), init: [a, a + 1, a + 2] },
             OpCode::ForLoop => Ins::ForLoop { a, var: a + 3, target: target(pc, sbx) },
             OpCode::LuaDecTForLoop => {
                 if v51 {
@@ -226,7 +253,7 @@ pub fn decode(proto: &Proto) -> Decoded {
                     c
                 };
                 let first = (block.max(1) as u64 - 1) * 50 + 1;
-                Ins::SetList { a, n: if b == 0 { None } else { Some(b as u16) }, first }
+                Ins::SetList { a, src: a + 1, n: if b == 0 { None } else { Some(b as u16) }, first }
             }
             OpCode::Close => Ins::Close { a },
             OpCode::Closure => {
@@ -268,6 +295,17 @@ fn finish(mut ins: Vec<Ins>, data: Vec<bool>) -> Decoded {
     let n = ins.len();
     for pc in 0..n {
         if data[pc] { ins[pc] = Ins::Data; }
+    }
+    // A jump onto a no-op (a Luau FASTCALL hint) continues after it.
+    let real = |mut t: usize| { while t < n && data[t] { t += 1; } t };
+    for i in ins.iter_mut() {
+        match i {
+            Ins::Jmp { target, .. } | Ins::Branch { target, .. } | Ins::LoadBoolJump { target, .. }
+            | Ins::ForPrep { target, .. } | Ins::ForLoop { target, .. } | Ins::TForLoop { target, .. } => {
+                *target = real(*target);
+            }
+            _ => {}
+        }
     }
     let mut next = vec![0; n];
     for pc in 0..n {
@@ -441,7 +479,7 @@ fn decode54(proto: &Proto) -> Decoded {
             // FORLOOP jumps back to the body; FORPREP is treated as jumping
             // to FORLOOP (as in 5.3): same loop, test placed differently.
             73 => Ins::ForLoop { a, var: if v55 { a + 2 } else { a + 3 }, target: to(pc, -(bx as i64)) },
-            74 => Ins::ForPrep { a, target: to(pc, bx as i64) },
+            74 => Ins::ForPrep { a, target: to(pc, bx as i64), init: [a, a + 1, a + 2] },
             75 => Ins::Jmp { target: to(pc, bx as i64), close: None },
             // 5.5's TFORPREP swaps control and closing value: the call reads
             // R(a+3) and its first result is the control.
@@ -457,7 +495,7 @@ fn decode54(proto: &Proto) -> Decoded {
                 };
                 let scale = if v55 { 1024 } else { 256 };
                 if k { first += extra(&mut data) as u64 * scale; }
-                Ins::SetList { a, n: if n == 0 { None } else { Some(n as u16) }, first: first + 1 }
+                Ins::SetList { a, src: a + 1, n: if n == 0 { None } else { Some(n as u16) }, first: first + 1 }
             }
             // GETVARG: R(b) is the vararg parameter, indexed like a table.
             200 => Ins::GetTable { a, t: b as Reg, key: Rk::R(c as Reg) },
@@ -491,6 +529,8 @@ pub fn successors(d: &Decoded, pc: usize) -> Vec<usize> {
         Ins::Jmp { target, .. } => vec![*target],
         Ins::Cmp { .. } | Ins::Test { .. } | Ins::TestSet { .. } => vec![nx, skip],
         Ins::LoadBool { skip: true, .. } => vec![skip],
+        Ins::LoadBoolJump { target, .. } => vec![*target],
+        Ins::Branch { target, .. } => vec![nx, *target],
         Ins::ForPrep { target, .. } => vec![*target],
         Ins::ForLoop { target, .. } | Ins::TForLoop { target, .. } => vec![*target, nx],
         Ins::TForLoop51 { .. } => vec![nx, skip],
@@ -507,5 +547,197 @@ pub fn ends_block(ins: &Ins) -> bool {
         Ins::Jmp { .. } | Ins::Cmp { .. } | Ins::Test { .. } | Ins::TestSet { .. }
         | Ins::LoadBool { skip: true, .. } | Ins::ForPrep { .. } | Ins::ForLoop { .. }
         | Ins::TForLoop { .. } | Ins::TForLoop51 { .. } | Ins::Return { .. }
-        | Ins::TailCall { .. })
+        | Ins::TailCall { .. } | Ins::Branch { .. } | Ins::LoadBoolJump { .. })
+}
+
+/// Roblox clients store each Luau opcode multiplied by 227 (mod 256).
+pub const LUAU_OP_KEY: u8 = 227;
+
+/// Luau opcode numbers (Common/include/Luau/Bytecode.h).
+mod lop {
+    pub const NOP: u32 = 0; pub const BREAK: u32 = 1; pub const LOADNIL: u32 = 2; pub const LOADB: u32 = 3;
+    pub const LOADN: u32 = 4; pub const LOADK: u32 = 5; pub const MOVE: u32 = 6; pub const GETGLOBAL: u32 = 7;
+    pub const SETGLOBAL: u32 = 8; pub const GETUPVAL: u32 = 9; pub const SETUPVAL: u32 = 10;
+    pub const CLOSEUPVALS: u32 = 11; pub const GETIMPORT: u32 = 12; pub const GETTABLE: u32 = 13;
+    pub const SETTABLE: u32 = 14; pub const GETTABLEKS: u32 = 15; pub const SETTABLEKS: u32 = 16;
+    pub const GETTABLEN: u32 = 17; pub const SETTABLEN: u32 = 18; pub const NEWCLOSURE: u32 = 19;
+    pub const NAMECALL: u32 = 20; pub const CALL: u32 = 21; pub const RETURN: u32 = 22; pub const JUMP: u32 = 23;
+    pub const JUMPBACK: u32 = 24; pub const JUMPIF: u32 = 25; pub const JUMPIFNOT: u32 = 26;
+    pub const JUMPIFEQ: u32 = 27; pub const JUMPIFLE: u32 = 28; pub const JUMPIFLT: u32 = 29;
+    pub const JUMPIFNOTEQ: u32 = 30; pub const JUMPIFNOTLE: u32 = 31; pub const JUMPIFNOTLT: u32 = 32;
+    pub const ADD: u32 = 33; pub const POW: u32 = 38; pub const ADDK: u32 = 39; pub const POWK: u32 = 44;
+    pub const AND: u32 = 45; pub const OR: u32 = 46; pub const ANDK: u32 = 47; pub const ORK: u32 = 48;
+    pub const CONCAT: u32 = 49; pub const NOT: u32 = 50; pub const MINUS: u32 = 51; pub const LENGTH: u32 = 52;
+    pub const NEWTABLE: u32 = 53; pub const DUPTABLE: u32 = 54; pub const SETLIST: u32 = 55;
+    pub const FORNPREP: u32 = 56; pub const FORNLOOP: u32 = 57; pub const FORGLOOP: u32 = 58;
+    pub const FORGPREP_INEXT: u32 = 59; pub const FASTCALL3: u32 = 60; pub const FORGPREP_NEXT: u32 = 61;
+    pub const NATIVECALL: u32 = 62; pub const GETVARARGS: u32 = 63; pub const DUPCLOSURE: u32 = 64;
+    pub const PREPVARARGS: u32 = 65; pub const LOADKX: u32 = 66; pub const JUMPX: u32 = 67;
+    pub const FASTCALL: u32 = 68; pub const COVERAGE: u32 = 69; pub const CAPTURE: u32 = 70;
+    pub const SUBRK: u32 = 71; pub const DIVRK: u32 = 72; pub const FASTCALL1: u32 = 73;
+    pub const FASTCALL2: u32 = 74; pub const FASTCALL2K: u32 = 75; pub const FORGPREP: u32 = 76;
+    pub const JUMPXEQKNIL: u32 = 77; pub const JUMPXEQKB: u32 = 78; pub const JUMPXEQKN: u32 = 79;
+    pub const JUMPXEQKS: u32 = 80; pub const IDIV: u32 = 81; pub const IDIVK: u32 = 82;
+    pub const GETUDATAKS: u32 = 83; pub const SETUDATAKS: u32 = 84; pub const NAMECALLUDATA: u32 = 85;
+    pub const FASTPCALL: u32 = 89;
+
+    /// Instructions followed by an AUX word (Luau/BytecodeUtils.h).
+    pub fn has_aux(op: u32) -> bool {
+        matches!(op, GETGLOBAL | SETGLOBAL | GETIMPORT | GETTABLEKS | SETTABLEKS | NAMECALL
+            | JUMPIFEQ..=JUMPIFNOTLT | NEWTABLE | SETLIST | FORGLOOP | LOADKX | FASTCALL2 | FASTCALL2K
+            | FASTCALL3 | JUMPXEQKNIL..=JUMPXEQKS | GETUDATAKS..=NAMECALLUDATA | 86..=88 | 90 | 91 | 93 | 94)
+    }
+}
+
+/// Luau: an 8-bit opcode, then A, B, C bytes (or A and a signed 16-bit D, or
+/// a signed 24-bit E); some instructions take one AUX word.  Jump targets are
+/// `pc + 1 + D`, counting AUX words.
+fn decode_luau(proto: &Proto) -> Decoded {
+    let code = &proto.code;
+    let n = code.len();
+    let mut ins: Vec<Ins> = vec![Ins::Unknown; n];
+    let mut data = vec![false; n];
+
+    let mut pc = 0;
+    while pc < n {
+        let i = code[pc];
+        let op = i & 0xFF;
+        let a = ((i >> 8) & 0xFF) as Reg;
+        let b = (i >> 16) & 0xFF;
+        let c = (i >> 24) & 0xFF;
+        let d = (i as i32) >> 16;
+        let aux = code.get(pc + 1).copied().unwrap_or(0);
+        let to = |off: i64| {
+            let t = pc as i64 + 1 + off;
+            if t < 0 { usize::MAX } else { t as usize }
+        };
+        let jd = to(d as i64);
+        let opt = |v: u32| if v == 0 { None } else { Some((v - 1) as u16) };
+        let arith = |o: u32| [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod, BinOp::Pow][o as usize].clone();
+        let mut len = if lop::has_aux(op) { 2 } else { 1 };
+        ins[pc] = match op {
+            lop::LOADNIL => Ins::LoadNil { a, last: a },
+            lop::LOADB if c == 0 => Ins::LoadBool { a, val: b != 0, skip: false },
+            lop::LOADB => Ins::LoadBoolJump { a, val: b != 0, target: to(c as i64) },
+            lop::LOADN => Ins::LoadImm { a, v: Rk::Int(d as i64) },
+            lop::LOADK => Ins::LoadK { a, k: d as u16 as u32 },
+            lop::LOADKX => Ins::LoadK { a, k: aux },
+            lop::MOVE => Ins::Move { a, b: b as Reg },
+            lop::GETGLOBAL => Ins::GetGlobal { a, k: aux },
+            lop::SETGLOBAL => Ins::SetGlobal { a, k: aux },
+            lop::GETUPVAL => Ins::GetUpval { a, up: b as u16 },
+            lop::SETUPVAL => Ins::SetUpval { a, up: b as u16 },
+            lop::CLOSEUPVALS => Ins::Close { a },
+            lop::GETIMPORT => {
+                let count = aux >> 30;
+                let path = [(aux >> 20) & 1023, (aux >> 10) & 1023, aux & 1023];
+                Ins::GetImport { a, path: path[..count.min(3) as usize].to_vec() }
+            }
+            lop::GETTABLE => Ins::GetTable { a, t: b as Reg, key: Rk::R(c as Reg) },
+            lop::SETTABLE => Ins::SetTable { t: b as Reg, key: Rk::R(c as Reg), val: Rk::R(a) },
+            lop::GETTABLEKS => Ins::GetTable { a, t: b as Reg, key: Rk::K(aux) },
+            lop::SETTABLEKS => Ins::SetTable { t: b as Reg, key: Rk::K(aux), val: Rk::R(a) },
+            // Runtime rewrites of the KS forms; the AUX keeps the constant in its low half.
+            lop::GETUDATAKS => Ins::GetTable { a, t: b as Reg, key: Rk::K(aux & 0xFFFF) },
+            lop::SETUDATAKS => Ins::SetTable { t: b as Reg, key: Rk::K(aux & 0xFFFF), val: Rk::R(a) },
+            lop::GETTABLEN => Ins::GetTable { a, t: b as Reg, key: Rk::Int(c as i64 + 1) },
+            lop::SETTABLEN => Ins::SetTable { t: b as Reg, key: Rk::Int(c as i64 + 1), val: Rk::R(a) },
+            lop::NEWCLOSURE | lop::DUPCLOSURE => {
+                // DUPCLOSURE's constant names the child proto.
+                let idx = if op == lop::NEWCLOSURE {
+                    d as u16 as usize
+                } else {
+                    match proto.constants.get(d as u16 as usize) {
+                        Some(disassembler::LuaConstant::Proto(p)) => *p,
+                        _ => usize::MAX,
+                    }
+                };
+                let nups = proto.p.get(idx).map_or(0, |p| p.num_upvalues as usize);
+                let mut caps = Vec::with_capacity(nups);
+                for k in 0..nups {
+                    let Some(&w) = code.get(pc + 1 + k) else { break };
+                    if w & 0xFF != lop::CAPTURE { break; }
+                    let (kind, r) = ((w >> 8) & 0xFF, (w >> 16) & 0xFF);
+                    caps.push(match kind {
+                        0 => Cap::Val(r as Reg),
+                        1 => Cap::Reg(r as Reg),
+                        _ => Cap::Up(r as u16),
+                    });
+                    len += 1;
+                }
+                Ins::Closure { a, idx, caps }
+            }
+            lop::NAMECALL => Ins::SelfOp { a, obj: b as Reg, key: Rk::K(aux) },
+            lop::NAMECALLUDATA => Ins::SelfOp { a, obj: b as Reg, key: Rk::K(aux & 0xFFFF) },
+            lop::CALL => Ins::Call { a, nargs: opt(b), nret: opt(c) },
+            lop::RETURN => Ins::Return { a, n: opt(b) },
+            lop::JUMP | lop::JUMPBACK => Ins::Jmp { target: jd, close: None },
+            lop::JUMPX => Ins::Jmp { target: to(((i as i32) >> 8) as i64), close: None },
+            lop::JUMPIF => Ins::Branch { cond: BranchCond::Truthy(a), negate: false, target: jd },
+            lop::JUMPIFNOT => Ins::Branch { cond: BranchCond::Truthy(a), negate: true, target: jd },
+            lop::JUMPIFEQ..=lop::JUMPIFNOTLT => {
+                let k = op - lop::JUMPIFEQ;
+                let cop = [CmpOp::Eq, CmpOp::Le, CmpOp::Lt][(k % 3) as usize];
+                let cond = BranchCond::Cmp { op: cop, l: Rk::R(a), r: Rk::R(aux as Reg) };
+                Ins::Branch { cond, negate: k >= 3, target: jd }
+            }
+            lop::JUMPXEQKNIL..=lop::JUMPXEQKS => {
+                let r = match op {
+                    lop::JUMPXEQKNIL => Rk::Nil,
+                    lop::JUMPXEQKB => Rk::Bool(aux & 1 != 0),
+                    _ => Rk::K(aux & 0xFF_FFFF),
+                };
+                let cond = BranchCond::Cmp { op: CmpOp::Eq, l: Rk::R(a), r };
+                Ins::Branch { cond, negate: aux >> 31 != 0, target: jd }
+            }
+            lop::ADD..=lop::POW => Ins::Arith { a, op: arith(op - lop::ADD), l: Rk::R(b as Reg), r: Rk::R(c as Reg) },
+            lop::ADDK..=lop::POWK => Ins::Arith { a, op: arith(op - lop::ADDK), l: Rk::R(b as Reg), r: Rk::K(c) },
+            lop::SUBRK => Ins::Arith { a, op: BinOp::Sub, l: Rk::K(b), r: Rk::R(c as Reg) },
+            lop::DIVRK => Ins::Arith { a, op: BinOp::Div, l: Rk::K(b), r: Rk::R(c as Reg) },
+            lop::IDIV => Ins::Arith { a, op: BinOp::IDiv, l: Rk::R(b as Reg), r: Rk::R(c as Reg) },
+            lop::IDIVK => Ins::Arith { a, op: BinOp::IDiv, l: Rk::R(b as Reg), r: Rk::K(c) },
+            // Both operands are already computed registers/constants, so the
+            // source-level short circuit selects the same value.
+            lop::AND => Ins::Arith { a, op: BinOp::And, l: Rk::R(b as Reg), r: Rk::R(c as Reg) },
+            lop::OR => Ins::Arith { a, op: BinOp::Or, l: Rk::R(b as Reg), r: Rk::R(c as Reg) },
+            lop::ANDK => Ins::Arith { a, op: BinOp::And, l: Rk::R(b as Reg), r: Rk::K(c) },
+            lop::ORK => Ins::Arith { a, op: BinOp::Or, l: Rk::R(b as Reg), r: Rk::K(c) },
+            lop::CONCAT => Ins::Concat { a, b: b as Reg, c: c as Reg },
+            lop::NOT => Ins::Unary { a, op: UnOp::Not, b: b as Reg },
+            lop::MINUS => Ins::Unary { a, op: UnOp::Neg, b: b as Reg },
+            lop::LENGTH => Ins::Unary { a, op: UnOp::Len, b: b as Reg },
+            lop::NEWTABLE => Ins::NewTable { a },
+            lop::DUPTABLE => Ins::DupTable { a, k: d as u16 as u32 },
+            lop::SETLIST => Ins::SetList { a, src: b as Reg, n: opt(c), first: aux as u64 },
+            // FORNPREP falls into the body or jumps past FORNLOOP; modelled
+            // (as for 5.4) as a jump to FORNLOOP, which tests and loops.
+            lop::FORNPREP => Ins::ForPrep { a, target: jd.wrapping_sub(1), init: [a + 2, a, a + 1] },
+            lop::FORNLOOP => Ins::ForLoop { a, var: a + 2, target: jd },
+            lop::FORGPREP | lop::FORGPREP_INEXT | lop::FORGPREP_NEXT => Ins::Jmp { target: jd, close: None },
+            // FORGLOOP: the call (at pc) and the test-and-jump (in the AUX slot).
+            lop::FORGLOOP => {
+                let nvars = ((aux & 0xFF) as u16).max(1);
+                if pc + 1 < n {
+                    ins[pc + 1] = Ins::TForLoop { a: a + 2, src: a + 3, target: jd };
+                }
+                len = 1; // the AUX slot holds the TFORLOOP part
+                Ins::TForCall { a, nvars, base: 3, ctl: 2 }
+            }
+            lop::GETVARARGS => Ins::VarArg { a, n: opt(b) },
+            // Hints and no-ops: the fast calls fall back to the following
+            // CALL, which computes the same result.
+            lop::NOP | lop::BREAK | lop::NATIVECALL | lop::PREPVARARGS | lop::COVERAGE | lop::CAPTURE
+            | lop::FASTCALL | lop::FASTCALL1 | lop::FASTCALL2 | lop::FASTCALL2K | lop::FASTCALL3
+            | lop::FASTPCALL => Ins::Data,
+            _ => Ins::Unknown,
+        };
+        if matches!(ins[pc], Ins::Data) { data[pc] = true; }
+        for w in pc + 1..(pc + len).min(n) { data[w] = true; }
+        if op == lop::FORGLOOP && pc + 1 < n {
+            pc += 2;
+        } else {
+            pc += len.max(1);
+        }
+    }
+    finish(ins, data)
 }

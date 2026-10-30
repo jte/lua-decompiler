@@ -158,7 +158,7 @@ fn scan_globals(proto: &Proto, is_env: &[bool], out: &mut BTreeSet<String>) {
             Ins::Closure { idx, caps, .. } => {
                 let child_env: Vec<bool> = caps.iter().map(|c| match c {
                     Cap::Up(j) => env(*j),
-                    Cap::Reg(_) => false,
+                    Cap::Reg(_) | Cap::Val(_) => false,
                 }).collect();
                 children.push((*idx, child_env));
             }
@@ -176,49 +176,61 @@ fn scan_globals(proto: &Proto, is_env: &[bool], out: &mut BTreeSet<String>) {
 /// A variable holding *all* results of a call or `...` (multret) that could
 /// not be folded into its consumer: keep every value by packing them into a
 /// table and unpacking at the use.
-fn materialize_packs(body: &mut Block, pack: &[bool], version: u8) {
+fn materialize_packs(body: &mut Block, pack: &[bool], version: u8, luau: bool) {
     let is_pack = |e: &Expr| crate::lift::var_id(e).map_or(false, |v| v < pack.len() && pack[v]);
     let call = |f: &str, args: Vec<Expr>| Expr::Call { func: Box::new(Expr::Name(f.to_string())), args };
     let index = |t: Expr, k: &str| Expr::Index { table: Box::new(t), key: Box::new(Expr::Str(k.as_bytes().to_vec())) };
-    // Uses first (every expression position)...
+    // `table.pack`/`table.unpack` (5.2+ and Luau), else `unpack`.
+    let has_table_pack = version >= 0x52 || luau;
+    // Uses first (every expression position): every value, nils included...
     lua_ast::transform_block(body, &mut |e: &mut Expr| {
         if is_pack(e) {
             let p = e.clone();
-            *e = if version >= 0x52 {
-                call("@unpack", vec![p.clone(), Expr::Integer(1), index(p, "n")])
-            } else {
-                call("@unpack", vec![p])
-            };
+            *e = call("@unpack", vec![p.clone(), Expr::Integer(1), index(p, "n")]);
         }
     });
-    // ...then turn the definitions back into packs.
-    fn fix(b: &mut Block, version: u8) {
+    // ...then turn the definitions back into packs with their count `n`.
+    fn fix(b: &mut Block, has_table_pack: bool) {
         for s in b.iter_mut() {
             if let lua_ast::Stat::Assign { lhs, rhs } = s {
                 if lhs.len() == 1 && rhs.len() == 1 {
                     if let Some(args) = pseudo_args(&lhs[0], "@unpack").cloned() {
                         lhs[0] = args[0].clone();
                         let e = std::mem::replace(&mut rhs[0], Expr::Nil);
-                        rhs[0] = if version >= 0x52 {
+                        rhs[0] = if has_table_pack {
                             Expr::Call {
                                 func: Box::new(Expr::Index { table: Box::new(Expr::Name("table".into())), key: Box::new(Expr::Str(b"pack".to_vec())) }),
                                 args: vec![e],
                             }
                         } else {
-                            Expr::Table(vec![lua_ast::TableField::ValueField(e)])
+                            // 5.1: `(function(...) return {n = select("#", ...), ...} end)(e)`
+                            let count = Expr::Call {
+                                func: Box::new(Expr::Name("select".into())),
+                                args: vec![Expr::Str(b"#".to_vec()), Expr::Vararg],
+                            };
+                            let packer = FuncBody {
+                                params: vec![],
+                                has_vararg: true,
+                                vararg_name: None,
+                                body: vec![lua_ast::Stat::Return(vec![Expr::Table(vec![
+                                    lua_ast::TableField::NameField("n".into(), count),
+                                    lua_ast::TableField::ValueField(Expr::Vararg),
+                                ])])],
+                            };
+                            Expr::Call { func: Box::new(Expr::Function(Box::new(packer))), args: vec![e] }
                         };
                     }
                 }
             }
-            astpass::for_each_child_mut(s, &mut |c| fix(c, version));
+            astpass::for_each_child_mut(s, &mut |c| fix(c, has_table_pack));
         }
     }
-    fix(body, version);
+    fix(body, has_table_pack);
     // The remaining `@unpack` calls become real ones.
     lua_ast::transform_block(body, &mut |e: &mut Expr| {
         if let Expr::Call { func, .. } = e {
             if matches!(func.as_ref(), Expr::Name(n) if n == "@unpack") {
-                **func = if version >= 0x52 {
+                **func = if has_table_pack {
                     Expr::Index { table: Box::new(Expr::Name("table".into())), key: Box::new(Expr::Str(b"unpack".to_vec())) }
                 } else {
                     Expr::Name("unpack".into())
@@ -253,6 +265,8 @@ fn decompile_fn(
     method: bool,
     force_flat: bool,
 ) -> FuncBody {
+    // Testing aid: LUADEC_FORCE_FLAT decompiles every function goto-based.
+    let force_flat = force_flat || std::env::var_os("LUADEC_FORCE_FLAT").is_some();
     let d = ir::decode(proto);
     let flow = Flow::build(&d);
     // A 5.5 named vararg parameter (`...t`) is one more register parameter.
@@ -281,6 +295,8 @@ fn decompile_fn(
         closure_boxes: BTreeMap::new(),
         skip_pc: BTreeSet::new(),
         method_at: BTreeMap::new(),
+        flat: flat_mode,
+        val_copies: Vec::new(),
     };
     let mut blocks = lifter.lift_all();
     let after_lift = lifter.next_var;
@@ -296,6 +312,8 @@ fn decompile_fn(
         }).collect(),
         pack: pack_vars(&d, &flow, &an),
     };
+    // Luau by-value captures name a variable for the closure: keep it.
+    for v in val_captured(&d, &flow, &an) { facts.pinned[v] = true; }
     // Temporaries made by the lifter stay put.
     facts.defs.resize(after_lift, 0);
     facts.uses.resize(after_lift, 0);
@@ -322,7 +340,7 @@ fn decompile_fn(
     let flow = Flow::rebuild(flow.nodes, flow.entry, &empty);
     let mut next_var = after_lift;
     let mut body = if flat_mode || flow.irreducible {
-        structure::flat(&flow, &blocks, &mut next_var, &boxed_vars)
+        structure::flat(&flow, &blocks, &mut next_var, &boxed_vars, proto.luau)
     } else {
         let mut s = structure::Structurer::new(&flow, &blocks, &an.live_in_vars);
         let b = s.run();
@@ -352,7 +370,7 @@ fn decompile_fn(
         astpass::simplify(&mut body);
     }
     env_to_globals(&mut body, &ctx.globals);
-    materialize_packs(&mut body, &facts.pack, proto.version);
+    materialize_packs(&mut body, &facts.pack, proto.version, proto.luau);
     astpass::raise_generic_for(&mut body);
     astpass::scope_tbc(&mut body);
 
@@ -373,6 +391,10 @@ fn decompile_fn(
     avoid.extend(upnames.iter().cloned());
     // Names the decompiler itself may emit as globals.
     for g in ["_ENV", "_G", "table", "unpack", "next", "select"] { avoid.insert(g.into()); }
+    if proto.luau {
+        // Used by the flat form of generalized iteration.
+        for g in ["type", "getmetatable"] { avoid.insert(g.into()); }
+    }
     let names = names::assign(&all, &params, &debug, &kinds, &avoid);
     declare::rename(&mut body, &names);
 
@@ -380,6 +402,16 @@ fn decompile_fn(
     fill_closures(&mut body, proto, ctx, &closure_boxes);
 
     astpass::finalize(&mut body, true);
+    // Luau has no goto: `continue`, else a dispatch loop over flat code.
+    if proto.luau {
+        astpass::luau_continue(&mut body);
+        if astpass::has_goto(&body) {
+            if !force_flat {
+                return decompile_fn(proto, upnames, is_env, boxed_up, ctx, method, true);
+            }
+            astpass::luau_dispatch(&mut body);
+        }
+    }
     astpass::rename_labels(&mut body);
 
     let mut param_names: Vec<String> = params.iter().map(|v| names[v].clone()).collect();
@@ -390,6 +422,23 @@ fn decompile_fn(
         vararg_name,
         body,
     }
+}
+
+/// Variables a closure captures by value (Luau CAPTURE VAL): the leading
+/// uses of each closure op (captured registers come last).
+fn val_captured(d: &ir::Decoded, flow: &Flow, an: &webs::Analysis) -> Vec<VarId> {
+    let mut out = Vec::new();
+    for (b, node) in flow.nodes.iter().enumerate() {
+        for (i, op) in node.ops.iter().enumerate() {
+            let flow::Op::Pc(pc) = op else { continue };
+            let Ins::Closure { caps, .. } = &d.ins[*pc] else { continue };
+            let nval = caps.iter().filter(|c| matches!(c, Cap::Val(_))).count();
+            if let Some(info) = an.ops.get(b).and_then(|o| o.get(i)) {
+                out.extend(info.use_var.iter().take(nval).copied());
+            }
+        }
+    }
+    out
 }
 
 /// Variables that hold every result of a call or `...` (multret).

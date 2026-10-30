@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::flow::{Flow, Op, Term};
-use crate::ir::{Cap, Decoded, Ins, Reg, Rk};
+use crate::ir::{BranchCond, Cap, Decoded, Ins, Reg, Rk};
 
 pub type VarId = usize;
 
@@ -109,12 +109,17 @@ fn uses_defs(
     };
     match op {
         Op::Copy { dst, src } => { u.push(src); df.push(dst); }
-        Op::NumForInit { a } => { u.extend([a, a + 1, a + 2]); }
+        Op::NumForInit { regs } => { u.extend(regs); }
         Op::GenForInit { a, n } => { u.extend(a..a + n); }
         Op::Pc(pc) => match &d.ins[pc] {
             Ins::Move { a, b } => { u.push(*b); df.push(*a); }
             Ins::LoadK { a, .. } | Ins::LoadImm { a, .. } | Ins::LoadBool { a, .. } | Ins::GetUpval { a, .. }
-            | Ins::GetGlobal { a, .. } | Ins::NewTable { a } => df.push(*a),
+            | Ins::GetGlobal { a, .. } | Ins::NewTable { a } | Ins::LoadBoolJump { a, .. }
+            | Ins::GetImport { a, .. } | Ins::DupTable { a, .. } => df.push(*a),
+            Ins::Branch { cond, .. } => match cond {
+                BranchCond::Truthy(a) => u.push(*a),
+                BranchCond::Cmp { l, r, .. } => { rk_regs(&mut u, *l); rk_regs(&mut u, *r); }
+            },
             Ins::LoadNil { a, last } => { for r in *a..=*last { df.push(r); } }
             Ins::GetTabUp { a, key, .. } => { rk_regs(&mut u, *key); df.push(*a); }
             Ins::GetTable { a, t, key } => { u.push(*t); rk_regs(&mut u, *key); df.push(*a); }
@@ -151,11 +156,11 @@ fn uses_defs(
                 Some(k) => { for r in *a..a + k { u.push(r); } }
                 None => range_to_top(*a, pc, &mut u),
             },
-            Ins::SetList { a, n, .. } => {
+            Ins::SetList { a, src, n, .. } => {
                 u.push(*a);
                 match n {
-                    Some(k) => { for r in a + 1..=a + k { u.push(r); } }
-                    None => range_to_top(a + 1, pc, &mut u),
+                    Some(k) => { for r in *src..src + k { u.push(r); } }
+                    None => range_to_top(*src, pc, &mut u),
                 }
             }
             Ins::ForPrep { .. } => {}
@@ -173,6 +178,9 @@ fn uses_defs(
                 for r in a + 3..a + 3 + nvars { df.push(r); }
             }
             Ins::Closure { a, caps, .. } => {
+                // Registers copied by value (plain reads) first, then the
+                // captured registers (the trailing `ncaps` uses).
+                for c in caps { if let Cap::Val(r) = c { u.push(*r); } }
                 for c in caps { if let Cap::Reg(r) = c { u.push(*r); ncaps += 1; } }
                 df.push(*a);
             }

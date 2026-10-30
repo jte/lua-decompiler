@@ -112,6 +112,11 @@ function describeHeader(bytes) {
   if (sig.startsWith("\x1bLJ")) {
     return { ok: false, text: "LuaJIT bytecode is not supported" };
   }
+  // Luau (Roblox) bytecode starts with its format version; 0 means the file
+  // holds a compile error instead.
+  const lv = bytes[0];
+  if (lv === 0 && bytes.length > 1) return { ok: false, text: "Luau compile error, not bytecode" };
+  if ((lv >= 3 && lv <= 14) || lv === 100) return { ok: true, text: `Luau bytecode (version ${lv})` };
   return { ok: false, text: "No Lua bytecode header — is this a compiled chunk?" };
 }
 

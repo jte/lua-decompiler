@@ -1,6 +1,12 @@
 pub use luac_parser::{LuaConstant, LuaNumber};
 
 mod lua54;
+mod luau;
+
+/// Words taken by a Luau instruction with this opcode (1, or 2 with AUX).
+pub fn luau_op_length(op: u32) -> usize {
+    if luau::has_aux(op) { 2 } else { 1 }
+}
 use luac_parser::{LuaChunk, UpVal};
 use std::cell::Cell;
 
@@ -13,6 +19,9 @@ thread_local! {
 pub fn set_lua_version(v: u8) {
     LUA_VERSION.with(|c| c.set(v));
 }
+
+/// Header version byte of Luau bytecode (`luac_parser::LUAU`).
+pub const LUAU_VERSION: u8 = 0xB0;
 
 pub fn lua_version() -> u8 {
     LUA_VERSION.with(|c| c.get())
@@ -313,6 +322,8 @@ pub struct LocVar {
     pub name: String,
     pub start_pc: usize,
     pub end_pc: usize,
+    /// Its register, when the debug info records it (Luau).
+    pub reg: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -335,6 +346,9 @@ pub struct Proto {
     pub num_upvalues: u8,
     /// Debug-info locals (empty for stripped chunks).
     pub locals: Vec<LocVar>,
+    /// Luau bytecode (`version` is then 0x51: Luau numbers and globals
+    /// behave like Lua 5.1's).
+    pub luau: bool,
 }
 
 impl From<LuaChunk> for Proto {
@@ -353,7 +367,8 @@ impl From<LuaChunk> for Proto {
             .map(|u: UpVal| UpvalDesc { on_stack: u.on_stack, idx: u.id })
             .collect();
         let p = chunk.prototypes.into_iter().map(Proto::from).collect();
-        let version = lua_version();
+        let luau = lua_version() == LUAU_VERSION;
+        let version = if luau { 0x51 } else { lua_version() };
         // Some Lua 5.2 variants set number_integral to a non-zero value but still
         // store numbers as IEEE 754 doubles (the raw 8 bytes are a double bit pattern
         // reinterpreted as an integer).  Re-interpret any Integer constant whose bit
@@ -362,7 +377,7 @@ impl From<LuaChunk> for Proto {
         let constants = chunk.constants.into_iter().map(|c| {
             if let LuaConstant::Number(LuaNumber::Integer(v)) = c {
                 let f = f64::from_bits(v as u64);
-                if version < 0x53 && f.is_finite() && !f.is_subnormal() {
+                if version < 0x53 && !luau && f.is_finite() && !f.is_subnormal() {
                     return LuaConstant::Number(LuaNumber::Float(f));
                 }
                 return LuaConstant::Number(LuaNumber::Integer(v));
@@ -373,6 +388,7 @@ impl From<LuaChunk> for Proto {
             name: l.name,
             start_pc: l.start_pc as usize,
             end_pc: l.end_pc as usize,
+            reg: if luau { Some(l.reg as u16) } else { None },
         }).collect();
         Proto {
             version,
@@ -380,7 +396,7 @@ impl From<LuaChunk> for Proto {
             linedefined: chunk.line_defined,
             numparams: chunk.num_params,
             is_vararg: chunk.is_vararg.is_some() as u8,
-            flags: if version >= 0x55 { chunk.flags } else { 0 },
+            flags: if version >= 0x55 || luau { chunk.flags } else { 0 },
             maxstacksize: chunk.max_stack,
             sizecode,
             code: chunk.instructions,
@@ -390,6 +406,7 @@ impl From<LuaChunk> for Proto {
             upvalue_names,
             upvalue_infos,
             num_upvalues,
+            luau,
         }
     }
 }
@@ -444,6 +461,7 @@ fn constant_to_string(c: &LuaConstant) -> String {
         LuaConstant::String(s) => format!("\"{}\"", escape_lua_string(s)),
         LuaConstant::Proto(p) => format!("<proto {}>", p),
         LuaConstant::Table(_) => "<table>".to_string(),
+        LuaConstant::Vector([x, y, z, _]) => format!("vector.create({}, {}, {})", x, y, z),
     }
 }
 
@@ -596,6 +614,9 @@ pub fn luadec_disassemble_str(fwork: &Proto, dflag: i32, name: Option<&str>) -> 
 }
 
 pub fn luadec_disassemble_to(fwork: &Proto, dflag: i32, name: Option<&str>, out: &mut dyn std::io::Write) {
+    if fwork.luau {
+        return luau::disassemble_to(fwork, name, out);
+    }
     if fwork.version >= 0x54 {
         return lua54::disassemble_to(fwork, name, out);
     }

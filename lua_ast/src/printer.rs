@@ -263,6 +263,8 @@ impl Printer {
                 }
             }
             Stat::Break => self.line("break"),
+            // Luau `continue` (see the decompiler's `astpass::CONTINUE`).
+            Stat::Goto(lbl) if lbl == "@continue" => self.line("continue"),
             Stat::Goto(lbl) => self.line(format!("goto {}", lbl)),
             Stat::Label(lbl) => self.line(format!("::{}::", lbl)),
             Stat::Call(e) => {

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Lua Decompiler Online — Decompile &amp; Deobfuscate Lua Bytecode (.luac)</title>
-  <meta name="description" content="Free online Lua decompiler. Turn compiled Lua 5.1, 5.2, 5.3, 5.4 and 5.5 bytecode (.luac) back into readable source and deobfuscate it — runs in your browser, nothing is uploaded.">
+  <meta name="description" content="Free online Lua decompiler. Turn compiled Lua 5.1–5.5 and Luau (Roblox) bytecode back into readable source and deobfuscate it — runs in your browser, nothing is uploaded.">
   <meta name="theme-color" content="#0b0d12">
   <meta name="robots" content="index, follow">
   <link rel="canonical" href="https://lua-decompiler.com/">
@@ -12,7 +12,7 @@
   <meta property="og:url" content="https://lua-decompiler.com/">
   <meta property="og:site_name" content="Lua Decompiler">
   <meta property="og:title" content="Lua Decompiler Online — Decompile &amp; Deobfuscate Lua Bytecode">
-  <meta property="og:description" content="Turn compiled Lua 5.1–5.5 bytecode back into readable source, right in your browser. Free, open source, nothing is uploaded.">
+  <meta property="og:description" content="Turn compiled Lua 5.1–5.5 and Luau bytecode back into readable source, right in your browser. Free, open source, nothing is uploaded.">
   <meta property="og:image" content="https://lua-decompiler.com/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -24,7 +24,7 @@
     "@type": "WebApplication",
     "name": "Lua Decompiler",
     "url": "https://lua-decompiler.com/",
-    "description": "Decompile and deobfuscate compiled Lua 5.1, 5.2, 5.3, 5.4 and 5.5 bytecode in the browser.",
+    "description": "Decompile and deobfuscate compiled Lua 5.1–5.5 and Luau (Roblox) bytecode in the browser.",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "Any (runs in the browser)",
     "browserRequirements": "Requires JavaScript and WebAssembly",
@@ -32,7 +32,7 @@
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "codeRepository": "https://github.com/jte/lua-decompiler",
     "featureList": [
-      "Decompile Lua 5.1, 5.2, 5.3, 5.4 and 5.5 bytecode",
+      "Decompile Lua 5.1, 5.2, 5.3, 5.4 and 5.5 bytecode", "Decompile Luau (Roblox) bytecode",
       "Deobfuscate: constant folding, string decryption, alias inlining, renaming",
       "Control-flow unflattening",
       "Bytecode disassembly",
@@ -83,7 +83,7 @@
   <header class="hero">
     <span class="badge"><span class="dot"></span>Open source · Rust + WebAssembly</span>
     <h1>Decompile &amp; deobfuscate<br><span class="grad">Lua bytecode</span></h1>
-    <p>Drop a compiled Lua 5.1–5.5 chunk and get readable source back. Everything runs in your browser — your file is never uploaded.</p>
+    <p>Drop a compiled Lua 5.1–5.5 or Luau chunk and get readable source back. Everything runs in your browser — your file is never uploaded.</p>
   </header>
 
   <main class="app">
@@ -176,7 +176,7 @@
     </details>
     <details>
       <summary>Which Lua versions are supported?</summary>
-      <p>Standard Lua 5.1, 5.2, 5.3, 5.4 and 5.5 bytecode, including Lua 5.2 files whose debug information has been corrupted by obfuscators. LuaJIT bytecode is not supported yet.</p>
+      <p>Standard Lua 5.1, 5.2, 5.3, 5.4 and 5.5 bytecode, including Lua 5.2 files whose debug information has been corrupted by obfuscators, and Luau (Roblox) bytecode, including the scrambled opcodes of bytecode taken from the Roblox client. LuaJIT bytecode is not supported yet.</p>
     </details>
     <details>
       <summary>Is my file uploaded anywhere?</summary>

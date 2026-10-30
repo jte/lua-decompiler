@@ -13,8 +13,9 @@ pub enum Op {
     Pc(usize),
     /// `dst := src` on one edge of a TESTSET (or a lowered TFORLOOP).
     Copy { dst: Reg, src: Reg },
-    /// Start of a canonical numeric for: consumes R(a), R(a+1), R(a+2).
-    NumForInit { a: Reg },
+    /// Start of a canonical numeric for: consumes the (start, limit, step)
+    /// registers.
+    NumForInit { regs: [Reg; 3] },
     /// Start of a canonical generic for: consumes R(a)..R(a+n-1) (n = 3, or 4
     /// in 5.4 with the closing value).
     GenForInit { a: Reg, n: u16 },
@@ -198,11 +199,20 @@ impl Flow {
                 Ins::Return { .. } | Ins::TailCall { .. } => {
                     nodes[id].term = Term::Exit;
                 }
-                Ins::Cmp { expect, .. } | Ins::Test { expect, .. } => {
+                Ins::Cmp { .. } | Ins::Test { .. } | Ins::Branch { .. } => {
                     let nx = d.next[last];
                     let skip = if nx < n { d.next[nx] } else { nx };
-                    // cond true → (expect ? next : skip)
-                    let (t, f) = if *expect { (nx, skip) } else { (skip, nx) };
+                    let (t, f) = match &d.ins[last] {
+                        // cond true → (expect ? next : skip)
+                        Ins::Cmp { expect, .. } | Ins::Test { expect, .. } => {
+                            if *expect { (nx, skip) } else { (skip, nx) }
+                        }
+                        // Luau: cond true → target (fall through when negated)
+                        Ins::Branch { negate, target, .. } => {
+                            if *negate { (nx, *target) } else { (*target, nx) }
+                        }
+                        _ => unreachable!(),
+                    };
                     match (node_of(t), node_of(f)) {
                         (Some(t), Some(f)) => {
                             nodes[id].term = Term::Cond { cond_pc: last };
@@ -292,9 +302,9 @@ impl Flow {
                         }
                     }
                 }
-                Ins::ForPrep { a, target } => {
+                Ins::ForPrep { a, target, init } => {
                     if matches!(d.ins.get(*target), Some(Ins::ForLoop { a: la, .. }) if la == a) {
-                        nodes[id].ops.push(Op::NumForInit { a: *a });
+                        nodes[id].ops.push(Op::NumForInit { regs: *init });
                     }
                 }
                 _ => {}

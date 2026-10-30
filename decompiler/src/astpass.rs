@@ -59,6 +59,7 @@ pub fn for_each_child_mut(s: &mut Stat, f: &mut impl FnMut(&mut Vec<Stat>)) {
 pub fn rename_labels(b: &mut Vec<Stat>) {
     let mut used = BTreeSet::new();
     collect_gotos(b, &mut used);
+    used.remove(CONTINUE);
     let map: std::collections::BTreeMap<String, String> = used.iter().enumerate()
         .map(|(i, l)| {
             let base = if l.starts_with("@c") { "continue" } else { "label" };
@@ -421,6 +422,144 @@ fn mentions(e: &Expr, t: &Expr) -> bool {
     let mut found = false;
     crate::simplify::lua_ast_walk(e, &mut |x| if x == t { found = true; });
     found
+}
+
+/// The jump target printed as Luau's `continue`.
+pub const CONTINUE: &str = "@continue";
+
+/// Luau has no `goto`.  A jump to the labels ending the innermost enclosing
+/// loop's body is `continue` (in `repeat`, it then evaluates the condition,
+/// as reaching the end does); labels nothing jumps to any more are dropped.
+pub fn luau_continue(b: &mut Vec<Stat>) {
+    fn trailing(body: &[Stat]) -> BTreeSet<String> {
+        body.iter().rev().map_while(|s| if let Stat::Label(l) = s { Some(l.clone()) } else { None }).collect()
+    }
+    fn walk(b: &mut Vec<Stat>, ends: &BTreeSet<String>) {
+        for s in b.iter_mut() {
+            match s {
+                Stat::Goto(l) if ends.contains(l) => *l = CONTINUE.to_string(),
+                Stat::While { body, .. } | Stat::Repeat { body, .. }
+                | Stat::NumFor { body, .. } | Stat::GenFor { body, .. } => {
+                    let t = trailing(body);
+                    walk(body, &t);
+                }
+                _ => for_each_child_mut(s, &mut |c| walk(c, ends)),
+            }
+        }
+    }
+    walk(b, &BTreeSet::new());
+    prune_labels(b);
+}
+
+/// Does `b` still contain a `goto` (other than `continue`) or a label?
+pub fn has_goto(b: &[Stat]) -> bool {
+    b.iter().any(|s| match s {
+        Stat::Goto(l) => l != CONTINUE,
+        Stat::Label(_) => true,
+        _ => {
+            let mut found = false;
+            for_each_child(s, &mut |c| found |= has_goto(c));
+            found
+        }
+    })
+}
+
+/// Luau: turn goto-based (flat) code into a dispatch loop.
+///
+/// ```lua
+/// <prologue>                  <prologue>
+/// ::A:: s1 goto C             local __pc = 1
+/// ::B:: s2                    while true do
+/// ::C:: s3                      if __pc == 1 then s1; __pc = 3; continue
+///                    →          elseif __pc == 2 then s2; __pc = 3; continue
+///                               elseif __pc == 3 then s3; break end
+///                             end
+/// ```
+///
+/// Every label must be at the top level and no `goto` inside a loop (true of
+/// flat output), so `continue` re-enters the dispatch.  Returns false (leaving
+/// `b` alone) otherwise.
+pub fn luau_dispatch(b: &mut Vec<Stat>) -> bool {
+    fn gotos_in_loops(b: &[Stat], in_loop: bool) -> bool {
+        b.iter().any(|s| match s {
+            Stat::Goto(l) => in_loop && l != CONTINUE,
+            Stat::Label(_) => in_loop,
+            Stat::While { body, .. } | Stat::Repeat { body, .. }
+            | Stat::NumFor { body, .. } | Stat::GenFor { body, .. } => gotos_in_loops(body, true),
+            _ => {
+                let mut found = false;
+                for_each_child(s, &mut |c| found |= gotos_in_loops(c, in_loop));
+                found
+            }
+        })
+    }
+    fn nested_labels(b: &[Stat]) -> bool {
+        b.iter().any(|s| {
+            let mut found = false;
+            for_each_child(s, &mut |c| found |= c.iter().any(|x| matches!(x, Stat::Label(_))) || nested_labels(c));
+            found
+        })
+    }
+    if !b.iter().any(|s| matches!(s, Stat::Label(_))) { return false; }
+    if gotos_in_loops(b, false) || nested_labels(b) { return false; }
+
+    let pc = || Expr::Name("__pc".into());
+    // The leading declarations stay outside the loop (every segment sees
+    // them); the code after them is the entry segment.
+    let first = b.iter().position(|s| !matches!(s, Stat::Local { .. })).unwrap_or(b.len());
+    let mut rest: Vec<Stat> = b.split_off(first);
+    let mut segments: Vec<(String, Vec<Stat>)> = vec![("@entry".into(), Vec::new())];
+    for s in rest.drain(..) {
+        match s {
+            Stat::Label(l) => segments.push((l, Vec::new())),
+            other => segments.last_mut().unwrap().1.push(other),
+        }
+    }
+    let ids: std::collections::BTreeMap<String, i64> =
+        segments.iter().enumerate().map(|(i, (l, _))| (l.clone(), i as i64 + 1)).collect();
+    let mut targets = BTreeSet::new();
+    for (_, s) in &segments { collect_gotos(s, &mut targets); }
+    if targets.iter().any(|t| t != CONTINUE && !ids.contains_key(t)) {
+        // A jump to a label that is not a segment: leave the code alone.
+        for (l, s) in segments { b.push(Stat::Label(l)); b.extend(s); }
+        return false;
+    }
+    // `goto L` → `__pc = id(L); continue`.
+    fn redirect(b: &mut Vec<Stat>, ids: &std::collections::BTreeMap<String, i64>) {
+        let old = std::mem::take(b);
+        for mut s in old {
+            match &s {
+                Stat::Goto(l) if l != CONTINUE => {
+                    b.push(Stat::Assign { lhs: vec![Expr::Name("__pc".into())], rhs: vec![Expr::Integer(ids[l])] });
+                    b.push(Stat::Goto(CONTINUE.into()));
+                }
+                _ => {
+                    for_each_child_mut(&mut s, &mut |c| redirect(c, ids));
+                    b.push(s);
+                }
+            }
+        }
+    }
+    let n = segments.len();
+    let mut branches = Vec::with_capacity(n);
+    for (i, (_, mut body)) in segments.into_iter().enumerate() {
+        redirect(&mut body, &ids);
+        let ends = matches!(body.last(), Some(Stat::Return(_) | Stat::Break))
+            || matches!(body.last(), Some(Stat::Goto(l)) if l == CONTINUE);
+        if !ends {
+            if i + 1 < n {
+                body.push(Stat::Assign { lhs: vec![pc()], rhs: vec![Expr::Integer(i as i64 + 2)] });
+                body.push(Stat::Goto(CONTINUE.into()));
+            } else {
+                body.push(Stat::Break);
+            }
+        }
+        let cond = Expr::BinOp { op: BinOp::Eq, lhs: Box::new(pc()), rhs: Box::new(Expr::Integer(i as i64 + 1)) };
+        branches.push((cond, body));
+    }
+    b.push(Stat::Local { names: vec!["__pc".into()], values: vec![Expr::Integer(1)] });
+    b.push(Stat::While { cond: Expr::True, body: vec![Stat::If { branches, else_body: None }] });
+    true
 }
 
 /// Lua 5.4 to-be-closed variables.  `@tbc(x, reg)` is followed, where the

@@ -10,7 +10,7 @@ use disassembler::{LuaConstant, LuaNumber, Proto};
 use lua_ast::{is_lua_ident, BinOp, Expr, Stat, TableField, UnOp};
 
 use crate::flow::{Flow, Op, Term};
-use crate::ir::{Cap, CmpOp, Decoded, Ins, Rk};
+use crate::ir::{BranchCond, Cap, CmpOp, Decoded, Ins, Rk};
 use crate::webs::{Analysis, OpInfo, VarId};
 
 pub fn var(v: VarId) -> Expr {
@@ -43,8 +43,35 @@ pub fn const_expr(c: Option<&LuaConstant>) -> Expr {
         Some(LuaConstant::Number(LuaNumber::Integer(i))) => Expr::Integer(*i),
         Some(LuaConstant::Number(LuaNumber::Float(f))) => Expr::Float(*f),
         Some(LuaConstant::String(s)) => Expr::Str(s.to_vec()),
+        // Luau vector constant.
+        Some(LuaConstant::Vector([x, y, z, _])) => Expr::Call {
+            func: Box::new(Expr::Index {
+                table: Box::new(Expr::Name("vector".into())),
+                key: Box::new(Expr::Str(b"create".to_vec())),
+            }),
+            args: vec![Expr::Float(*x), Expr::Float(*y), Expr::Float(*z)],
+        },
         Some(_) => Expr::Nil,
     }
+}
+
+/// A Luau DUPTABLE template: the fields that come with a value (the others
+/// are filled in by the stores that follow).
+fn template_expr(c: Option<&LuaConstant>) -> Expr {
+    let mut fields = Vec::new();
+    if let Some(LuaConstant::Table(t)) = c {
+        for (k, v) in &t.hash {
+            if matches!(v, LuaConstant::Null) { continue; }
+            let (k, v) = (const_expr(Some(k)), const_expr(Some(v)));
+            fields.push(match k {
+                Expr::Str(s) if std::str::from_utf8(&s).map_or(false, lua_ast::is_lua_ident) => {
+                    TableField::NameField(String::from_utf8(s).unwrap(), v)
+                }
+                k => TableField::IndexField(k, v),
+            });
+        }
+    }
+    Expr::Table(fields)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,6 +105,12 @@ pub struct Lifter<'a> {
     pub skip_pc: std::collections::BTreeSet<usize>,
     /// Call pc → (receiver variable, method name).
     pub method_at: std::collections::BTreeMap<usize, (VarId, String)>,
+    /// Goto-based output (locals hoisted to the top of the function).
+    pub flat: bool,
+    /// Copies for Luau by-value captures in flat code, `(copy, value)`:
+    /// the closure's statement is wrapped as `do local copy = value ... end`
+    /// so each closure keeps the value it was created with.
+    pub val_copies: Vec<(VarId, Expr)>,
 }
 
 impl<'a> Lifter<'a> {
@@ -268,6 +301,18 @@ impl<'a> Lifter<'a> {
             self.lift_op(b, op, info, cond_pc, &mut out);
             let cond = if !had_cond { out.cond.as_mut() } else { None };
             self.box_op(&mut out.stmts, start, cond, info);
+            if !self.val_copies.is_empty() {
+                // `do local copy = value; <closure statement> end`
+                let copies: Vec<Stat> = self.val_copies.drain(..)
+                    .map(|(c, v)| Stat::Assign { lhs: vec![var(c)], rhs: vec![v] }).collect();
+                if let Some(last) = out.stmts.pop() {
+                    let body = match last {
+                        Stat::Do(inner) => copies.into_iter().chain(inner).collect(),
+                        other => copies.into_iter().chain([other]).collect(),
+                    };
+                    out.stmts.push(Stat::Do(body));
+                }
+            }
         }
         match node.term {
             Term::NumFor { pc, .. } | Term::GenFor { pc, .. } => {
@@ -291,6 +336,8 @@ impl<'a> Lifter<'a> {
                 Rk::K(k) => self.k(k),
                 Rk::Int(v) => Expr::Integer(v),
                 Rk::Flt(bits) => Expr::Float(f64::from_bits(bits)),
+                Rk::Nil => Expr::Nil,
+                Rk::Bool(b) => if b { Expr::True } else { Expr::False },
             };
             let assign = |l: Expr, r: Expr| Stat::Assign { lhs: vec![l], rhs: vec![r] };
             match op {
@@ -312,6 +359,11 @@ impl<'a> Lifter<'a> {
                             }
                             Ins::Test { a, .. } => u(*a),
                             Ins::TestSet { b, .. } => u(*b),
+                            Ins::Branch { cond: BranchCond::Truthy(a), .. } => u(*a),
+                            Ins::Branch { cond: BranchCond::Cmp { op, l, r }, .. } => {
+                                let bop = match op { CmpOp::Eq => BinOp::Eq, CmpOp::Lt => BinOp::Lt, CmpOp::Le => BinOp::Le };
+                                Expr::BinOp { op: bop, lhs: Box::new(rk(*l)), rhs: Box::new(rk(*r)) }
+                            }
                             Ins::TForLoop { src, .. } => ne_nil(u(*src)),
                             Ins::TForLoop51 { a, nvars } => {
                                 // Lowered: call, then test the first result.
@@ -328,6 +380,15 @@ impl<'a> Lifter<'a> {
                         Ins::Move { a, b } => Some(assign(dv(*a), u(*b))),
                         Ins::LoadK { a, k } => Some(assign(dv(*a), self.k(*k))),
                         Ins::LoadImm { a, v } => Some(assign(dv(*a), rk(*v))),
+                        Ins::LoadBoolJump { a, val, .. } => Some(assign(dv(*a), if *val { Expr::True } else { Expr::False })),
+                        Ins::DupTable { a, k } => Some(assign(dv(*a), template_expr(self.proto.constants.get(*k as usize)))),
+                        Ins::GetImport { a, path } => {
+                            let mut e = global(self.k(path[0]), "_G");
+                            for &k in &path[1..] {
+                                e = Expr::Index { table: Box::new(e), key: Box::new(self.k(k)) };
+                            }
+                            Some(assign(dv(*a), e))
+                        }
                         // The register is used by `astpass::scope_tbc`, which
                         // leaves `@tbc(x)` (printed as `local x <close>`).
                         Ins::Tbc { a } => Some(Stat::Call(pseudo("@tbc", vec![u(*a), Expr::Integer(*a as i64)]))),
@@ -424,11 +485,28 @@ impl<'a> Lifter<'a> {
                         }
                         Ins::Closure { idx, caps, .. } => {
                             let mut args = vec![Expr::Integer(*idx as i64)];
-                            let mut k = 0;
+                            // Uses: by-value copies first, then captured registers.
+                            let mut kv = 0;
+                            let mut k = caps.iter().filter(|c| matches!(c, Cap::Val(_))).count();
                             let mut flags = vec![false; caps.len()];
                             for (ci, c) in caps.iter().enumerate() {
                                 match c {
                                     Cap::Reg(_) => { args.push(var(info.use_var[k])); k += 1; }
+                                    Cap::Val(_) => {
+                                        // The value (read through its box if
+                                        // another closure captures it by reference).
+                                        let id = info.use_var[kv];
+                                        let v = if self.boxed_vars.contains(&id) { box_slot(id) } else { var(id) };
+                                        kv += 1;
+                                        if self.flat {
+                                            let copy = self.next_var;
+                                            self.next_var += 1;
+                                            self.val_copies.push((copy, v));
+                                            args.push(var(copy));
+                                        } else {
+                                            args.push(v);
+                                        }
+                                    }
                                     Cap::Up(j) => {
                                         // Pass a boxed upvalue on as the box itself.
                                         flags[ci] = self.boxed_up.get(*j as usize).copied().unwrap_or(false);
@@ -457,7 +535,7 @@ impl<'a> Lifter<'a> {
                         Ins::ForPrep { .. } | Ins::ForLoop { .. } | Ins::TForCall { .. }
                         | Ins::TForLoop { .. } | Ins::TForLoop51 { .. } | Ins::Jmp { .. }
                         | Ins::Close { .. } | Ins::Data | Ins::Unknown
-                        | Ins::Cmp { .. } | Ins::Test { .. } | Ins::TestSet { .. } => None,
+                        | Ins::Cmp { .. } | Ins::Test { .. } | Ins::TestSet { .. } | Ins::Branch { .. } => None,
                     };
                     if let Some(s) = s { out.stmts.push(s); }
                 }

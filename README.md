@@ -13,6 +13,11 @@ entirely in your browser via WebAssembly; files are never uploaded.
   table constructors, closures, `<close>` variables, 5.5 named varargs
   (`...t`) and `global` declarations; local names come from debug info when
   present
+- Decompiles **Luau** (Roblox) bytecode, versions 3–14, into valid Luau:
+  `continue`, generalized iteration (`for k, v in t`), imports, table
+  templates; opcodes scrambled by the Roblox client are recognised and
+  decoded.  Luau has no `goto`, so code that cannot be structured becomes a
+  `while` loop over a state variable instead
 - Output is meant to behave exactly like the bytecode; unstructurable
   (irreducible) control flow falls back to `goto`
 - **Deobfuscation** passes that only rewrite what they can prove equivalent:

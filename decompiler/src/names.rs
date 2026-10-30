@@ -11,6 +11,10 @@ use crate::webs::{Analysis, VarId};
 /// starts (locals are allocated in declaration order).
 fn local_regs(proto: &Proto) -> Vec<u16> {
     let locs = &proto.locals;
+    // Luau records each local's register.
+    if locs.iter().all(|l| l.reg.is_some()) && !locs.is_empty() {
+        return locs.iter().map(|l| l.reg.unwrap()).collect();
+    }
     let mut regs = vec![0u16; locs.len()];
     let mut active: Vec<usize> = Vec::new();
     for i in 0..locs.len() {
