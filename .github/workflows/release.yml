@@ -51,6 +51,24 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p cli --target ${{ matrix.target }}
 
+      # Round trip on Linux: compile with real Lua, decompile, run both, compare.
+      - name: Smoke test
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq lua5.4 > /dev/null
+          cat > smoke.lua <<'EOF'
+          local t = {}
+          for i = 1, 5 do t[#t + 1] = i * i end
+          local function sum(xs) local s = 0 for _, v in ipairs(xs) do s = s + v end return s end
+          print(table.concat(t, ","), sum(t), ("x"):rep(3))
+          EOF
+          luac5.4 -o smoke.luac smoke.lua
+          bin=target/${{ matrix.target }}/release/cli
+          $bin smoke.luac out.lua --decompile
+          $bin smoke.luac out2.lua --deobfuscate
+          diff <(lua5.4 smoke.lua) <(lua5.4 out.lua)
+          diff <(lua5.4 smoke.lua) <(lua5.4 out2.lua)
+
       - name: Package
         shell: bash
         run: |
