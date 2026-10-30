@@ -75,12 +75,14 @@ pub enum Ins {
     TailCall { a: Reg, nargs: Option<u16> },
     Return { a: Reg, n: Option<u16> },
     ForPrep { a: Reg, target: usize },
-    ForLoop { a: Reg, target: usize },
-    /// 5.2+ TFORCALL: R(a+base..) := R(a)(R(a+1), R(a+2)), `nvars` results;
-    /// `base` is 3, or 4 in 5.4 (R(a+3) holds the closing value).
-    TForCall { a: Reg, nvars: u16, base: u16 },
+    /// `var` is the visible loop variable: R(a+3), or R(a+2) in 5.5.
+    ForLoop { a: Reg, var: Reg, target: usize },
+    /// 5.2+ TFORCALL: R(a+base..) := R(a)(R(a+1), R(a+ctl)), `nvars`
+    /// results.  base/ctl: 3/2 up to 5.3, 4/2 in 5.4 (R(a+3) holds the
+    /// closing value), 3/3 in 5.5 (the first variable is the control).
+    TForCall { a: Reg, nvars: u16, base: u16, ctl: u16 },
     /// 5.2+ TFORLOOP: if R(src) ~= nil then R(a) := R(src) and jump.  `a`
-    /// is the control register (TFORCALL's a+2), `src` the first variable.
+    /// is the control register (TFORCALL's a+ctl), `src` the first variable.
     TForLoop { a: Reg, src: Reg, target: usize },
     /// 5.1 TFORLOOP: call + test; skips the next instruction (the back JMP)
     /// when the loop ends.
@@ -90,6 +92,9 @@ pub enum Ins {
     Close { a: Reg },
     /// 5.4 TBC: R(a) becomes a to-be-closed variable.
     Tbc { a: Reg },
+    /// 5.5 ERRNNIL (`global x = ...`): error unless R(a) is nil; `name` is
+    /// the constant holding the global's name.
+    ErrNNil { a: Reg, name: Option<u32> },
     Closure { a: Reg, idx: usize, caps: Vec<Cap> },
     /// `n`: `None` = all varargs.
     VarArg { a: Reg, n: Option<u16> },
@@ -203,12 +208,12 @@ pub fn decode(proto: &Proto) -> Decoded {
             OpCode::TailCall => Ins::TailCall { a, nargs: opt(b) },
             OpCode::Return => Ins::Return { a, n: opt(b) },
             OpCode::ForPrep => Ins::ForPrep { a, target: target(pc, sbx) },
-            OpCode::ForLoop => Ins::ForLoop { a, target: target(pc, sbx) },
+            OpCode::ForLoop => Ins::ForLoop { a, var: a + 3, target: target(pc, sbx) },
             OpCode::LuaDecTForLoop => {
                 if v51 {
                     Ins::TForLoop51 { a, nvars: c.max(1) as u16 }
                 } else {
-                    Ins::TForCall { a, nvars: c.max(1) as u16, base: 3 }
+                    Ins::TForCall { a, nvars: c.max(1) as u16, base: 3, ctl: 2 }
                 }
             }
             OpCode::TForLoop => Ins::TForLoop { a, src: a + 1, target: target(pc, sbx) },
@@ -283,8 +288,32 @@ fn tm_binop(ev: u32) -> Option<BinOp> {
     })
 }
 
-/// Lua 5.4 (lopcodes.h): 7-bit opcode, A 8, k 1, B 8, C 8; Bx 17; sJ 25.
+/// 5.5 opcodes numbered as in 5.4: SHLI/SHRI swapped places, and GETVARG and
+/// ERRNNIL (here 200, 201) came in before VARARGPREP.
+fn op55_as_54(op: u32) -> u32 {
+    match op {
+        32 => 33,
+        33 => 32,
+        81 => 200,
+        82 => 201,
+        83 => 81,
+        84 => 82,
+        x => x,
+    }
+}
+
+/// Does this 5.5 function have a named vararg parameter (`...t`) that its
+/// code reads?  It lives in the register after the fixed parameters: a real
+/// table (PF_VATAB), or only indexed through GETVARG.
+pub fn named_vararg(proto: &Proto) -> bool {
+    proto.version >= 0x55 && proto.is_vararg != 0
+        && (proto.flags & 2 != 0 || proto.code.iter().any(|&i| i & 0x7F == 81))
+}
+
+/// Lua 5.4 and 5.5 (lopcodes.h): 7-bit opcode, A 8, k 1, B 8, C 8; Bx 17;
+/// sJ 25 (5.5 NEWTABLE/SETLIST: vB 6, vC 10).
 fn decode54(proto: &Proto) -> Decoded {
+    let v55 = proto.version >= 0x55;
     const OFFSET_SC: i64 = 127;
     const OFFSET_SBX: i64 = 65535;
     const OFFSET_SJ: i64 = 16_777_215;
@@ -346,7 +375,8 @@ fn decode54(proto: &Proto) -> Decoded {
             }
             Ins::Arith { a, op, l, r }
         };
-        ins[pc] = match op_of(i) {
+        let op = if v55 { op55_as_54(op_of(i)) } else { op_of(i) };
+        ins[pc] = match op {
             0 => Ins::Move { a, b: b as Reg },
             1 => Ins::LoadImm { a, v: Rk::Int(sbx) },
             2 => Ins::LoadImm { a, v: Rk::Flt((sbx as f64).to_bits()) },
@@ -367,18 +397,19 @@ fn decode54(proto: &Proto) -> Decoded {
             17 => Ins::SetTable { t: a, key: Rk::Int(b as i64), val: rkc(i) },
             18 => Ins::SetTable { t: a, key: Rk::K(b), val: rkc(i) },
             19 => { extra(&mut data); Ins::NewTable { a } }
-            20 => Ins::SelfOp { a, obj: b as Reg, key: rkc(i) },
+            // 5.5: the key is always a constant.
+            20 => Ins::SelfOp { a, obj: b as Reg, key: if v55 { Rk::K(c) } else { rkc(i) } },
             21 => arith(BinOp::Add, Rk::R(b as Reg), Rk::Int(sc(c)), &mut data),
             22..=31 => {
                 let op = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Mod, BinOp::Pow, BinOp::Div,
-                          BinOp::IDiv, BinOp::BAnd, BinOp::BOr, BinOp::BXor][(op_of(i) - 22) as usize].clone();
+                          BinOp::IDiv, BinOp::BAnd, BinOp::BOr, BinOp::BXor][(op - 22) as usize].clone();
                 arith(op, Rk::R(b as Reg), Rk::K(c), &mut data)
             }
             32 => arith(BinOp::Shr, Rk::R(b as Reg), Rk::Int(sc(c)), &mut data),
             33 => arith(BinOp::Shl, Rk::Int(sc(c)), Rk::R(b as Reg), &mut data),
             34..=45 => {
                 let op = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Mod, BinOp::Pow, BinOp::Div,
-                          BinOp::IDiv, BinOp::BAnd, BinOp::BOr, BinOp::BXor, BinOp::Shl, BinOp::Shr][(op_of(i) - 34) as usize].clone();
+                          BinOp::IDiv, BinOp::BAnd, BinOp::BOr, BinOp::BXor, BinOp::Shl, BinOp::Shr][(op - 34) as usize].clone();
                 arith(op, Rk::R(b as Reg), Rk::R(c as Reg), &mut data)
             }
             // A fallback not right after its arithmetic op.
@@ -409,16 +440,28 @@ fn decode54(proto: &Proto) -> Decoded {
             72 => Ins::Return { a, n: Some(1) },
             // FORLOOP jumps back to the body; FORPREP is treated as jumping
             // to FORLOOP (as in 5.3): same loop, test placed differently.
-            73 => Ins::ForLoop { a, target: to(pc, -(bx as i64)) },
+            73 => Ins::ForLoop { a, var: if v55 { a + 2 } else { a + 3 }, target: to(pc, -(bx as i64)) },
             74 => Ins::ForPrep { a, target: to(pc, bx as i64) },
             75 => Ins::Jmp { target: to(pc, bx as i64), close: None },
-            76 => Ins::TForCall { a, nvars: c.max(1) as u16, base: 4 },
+            // 5.5's TFORPREP swaps control and closing value: the call reads
+            // R(a+3) and its first result is the control.
+            76 if v55 => Ins::TForCall { a, nvars: c.max(1) as u16, base: 3, ctl: 3 },
+            76 => Ins::TForCall { a, nvars: c.max(1) as u16, base: 4, ctl: 2 },
+            77 if v55 => Ins::TForLoop { a: a + 3, src: a + 3, target: to(pc, -(bx as i64)) },
             77 => Ins::TForLoop { a: a + 2, src: a + 4, target: to(pc, -(bx as i64)) },
             78 => {
-                let mut first = c as u64;
-                if k { first += extra(&mut data) as u64 * 256; }
-                Ins::SetList { a, n: if b == 0 { None } else { Some(b as u16) }, first: first + 1 }
+                let (n, mut first) = if v55 {
+                    ((i >> 16) & 0x3F, ((i >> 22) & 0x3FF) as u64)
+                } else {
+                    (b, c as u64)
+                };
+                let scale = if v55 { 1024 } else { 256 };
+                if k { first += extra(&mut data) as u64 * scale; }
+                Ins::SetList { a, n: if n == 0 { None } else { Some(n as u16) }, first: first + 1 }
             }
+            // GETVARG: R(b) is the vararg parameter, indexed like a table.
+            200 => Ins::GetTable { a, t: b as Reg, key: Rk::R(c as Reg) },
+            201 => Ins::ErrNNil { a, name: if bx > 0 { Some(bx - 1) } else { None } },
             79 => {
                 let idx = bx as usize;
                 let caps = proto.p.get(idx).map_or(Vec::new(), |p| {

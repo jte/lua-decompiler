@@ -322,6 +322,8 @@ pub struct Proto {
     pub linedefined: u64,
     pub numparams: u8,
     pub is_vararg: u8,
+    /// Lua 5.5 prototype flags (PF_VAHID = 1, PF_VATAB = 2); 0 otherwise.
+    pub flags: u8,
     pub maxstacksize: u8,
     pub sizecode: usize,
     pub code: Vec<u32>,
@@ -378,6 +380,7 @@ impl From<LuaChunk> for Proto {
             linedefined: chunk.line_defined,
             numparams: chunk.num_params,
             is_vararg: chunk.is_vararg.is_some() as u8,
+            flags: if version >= 0x55 { chunk.flags } else { 0 },
             maxstacksize: chunk.max_stack,
             sizecode,
             code: chunk.instructions,

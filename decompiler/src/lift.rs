@@ -331,6 +331,11 @@ impl<'a> Lifter<'a> {
                         // The register is used by `astpass::scope_tbc`, which
                         // leaves `@tbc(x)` (printed as `local x <close>`).
                         Ins::Tbc { a } => Some(Stat::Call(pseudo("@tbc", vec![u(*a), Expr::Integer(*a as i64)]))),
+                        // Printed as `if x ~= nil then error(...) end`.
+                        Ins::ErrNNil { a, name } => {
+                            let name = name.map(|k| self.k(k)).unwrap_or(Expr::Str(b"?".to_vec()));
+                            Some(Stat::Call(pseudo("@errnnil", vec![u(*a), name])))
+                        }
                         // Where a block with to-be-closed variables ends.
                         Ins::Close { a } if self.proto.version >= 0x54
                             && self.d.ins.iter().any(|i| matches!(i, Ins::Tbc { .. })) =>
@@ -444,9 +449,9 @@ impl<'a> Lifter<'a> {
                                 rhs: vec![Expr::Vararg],
                             }),
                         },
-                        Ins::TForCall { a, nvars, base } if !matches!(node.term, Term::GenFor { .. }) => {
+                        Ins::TForCall { a, nvars, base, ctl } if !matches!(node.term, Term::GenFor { .. }) => {
                             let lhs: Vec<Expr> = (a + base..a + base + nvars).map(dv).collect();
-                            let call = Expr::Call { func: Box::new(u(*a)), args: vec![u(a + 1), u(a + 2)] };
+                            let call = Expr::Call { func: Box::new(u(*a)), args: vec![u(a + 1), u(a + ctl)] };
                             Some(Stat::Assign { lhs, rhs: vec![call] })
                         }
                         Ins::ForPrep { .. } | Ins::ForLoop { .. } | Ins::TForCall { .. }

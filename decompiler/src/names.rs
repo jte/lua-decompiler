@@ -38,7 +38,8 @@ pub fn debug_names(proto: &Proto, an: &Analysis) -> BTreeMap<VarId, String> {
     };
     for (v, info) in an.vars.iter().enumerate() {
         let name = if let Some(p) = info.param {
-            find(p, 0, false)
+            // A 5.5 vararg parameter starts after VARARGPREP.
+            find(p, 0, false).or_else(|| find(p, 1, false))
         } else {
             info.def_pcs.iter().find_map(|&pc| find(info.reg, pc, true))
                 .or_else(|| info.use_pcs.iter().find_map(|&pc| find(info.reg, pc, false)))

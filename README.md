@@ -8,10 +8,11 @@ entirely in your browser via WebAssembly; files are never uploaded.
 
 ## Features
 
-- Decompiles Lua **5.1, 5.2, 5.3 and 5.4** bytecode (`luac` output) back to source:
-  loops, `if`/`elseif`, `and`/`or` expressions, method calls, table
-  constructors, closures, Lua 5.4 `<close>` variables; local names come
-  from debug info when present
+- Decompiles Lua **5.1, 5.2, 5.3, 5.4 and 5.5** bytecode (`luac` output) back
+  to source: loops, `if`/`elseif`, `and`/`or` expressions, method calls,
+  table constructors, closures, `<close>` variables, 5.5 named varargs
+  (`...t`) and `global` declarations; local names come from debug info when
+  present
 - Output is meant to behave exactly like the bytecode; unstructurable
   (irreducible) control flow falls back to `goto`
 - **Deobfuscation** passes that only rewrite what they can prove equivalent:

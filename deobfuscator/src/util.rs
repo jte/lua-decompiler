@@ -71,7 +71,9 @@ pub fn count_refs(b: &[Stat], name: &str) -> usize {
         for e in stat_exprs(s) {
             walk_expr(e, &mut |x| {
                 if matches!(x, Expr::Name(m) if m == name) { n += 1; }
-                if let Expr::Function(fb) = x { n += fb.params.iter().filter(|p| *p == name).count(); }
+                if let Expr::Function(fb) = x {
+                    n += fb.params.iter().chain(&fb.vararg_name).filter(|p| *p == name).count();
+                }
             });
         }
     });
@@ -91,7 +93,7 @@ pub fn assigned_names(b: &[Stat]) -> BTreeSet<String> {
         _ => {}
     });
     visit_exprs(b, &mut |e| if let Expr::Function(fb) = e {
-        for p in &fb.params { *decls.entry(p.clone()).or_default() += 1; }
+        for p in fb.params.iter().chain(&fb.vararg_name) { *decls.entry(p.clone()).or_default() += 1; }
     });
     out.extend(decls.into_iter().filter(|(_, c)| *c > 1).map(|(n, _)| n));
     out

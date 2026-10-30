@@ -1,5 +1,6 @@
-//! Lua 5.4 bytecode listing.  5.4 changed the instruction layout (7-bit
-//! opcode, `k` flag, 25-bit jumps) and most opcodes, so it has its own table.
+//! Lua 5.4 and 5.5 bytecode listing.  5.4 changed the instruction layout
+//! (7-bit opcode, `k` flag, 25-bit jumps) and most opcodes, so it has its own
+//! table; 5.5 is listed with 5.4's numbering (see `op55_as_54`).
 
 use std::io::Write;
 
@@ -16,6 +17,20 @@ const NAMES: [&str; 83] = [
     "FORPREP", "TFORPREP", "TFORCALL", "TFORLOOP", "SETLIST", "CLOSURE", "VARARG", "VARARGPREP",
     "EXTRAARG",
 ];
+
+/// 5.5 opcodes numbered as in 5.4: SHLI/SHRI swapped places, and GETVARG and
+/// ERRNNIL (here 200, 201) came in before VARARGPREP.
+fn op55_as_54(op: u32) -> u32 {
+    match op {
+        32 => 33,
+        33 => 32,
+        81 => 200,
+        82 => 201,
+        83 => 81,
+        84 => 82,
+        x => x,
+    }
+}
 
 /// Source symbol of the arithmetic ops ADD..SHR (and their K/I forms).
 fn arith_sym(op: u32) -> &'static str {
@@ -39,9 +54,10 @@ pub fn disassemble_to(f: &Proto, name: Option<&str>, out: &mut dyn Write) {
     }
     let _ = writeln!(out);
 
+    let v55 = f.version >= 0x55;
     let k = |i: usize| f.constants.get(i).map(constant_to_string).unwrap_or_else(|| format!("K{}", i));
     for (pc, &i) in f.code.iter().enumerate() {
-        let op = i & 0x7F;
+        let op = if v55 { op55_as_54(i & 0x7F) } else { i & 0x7F };
         let a = (i >> 7) & 0xFF;
         let kf = (i >> 15) & 1;
         let b = (i >> 16) & 0xFF;
@@ -74,7 +90,10 @@ pub fn disassemble_to(f: &Proto, name: Option<&str>, out: &mut dyn Write) {
             17 => (format!("{} {} {}{}", a, b, c, if kf != 0 { "k" } else { "" }), format!("R{}[{}] := {}", a, b, rkc)),
             18 => (format!("{} {} {}{}", a, b, c, if kf != 0 { "k" } else { "" }), format!("R{}[{}] := {}", a, k(b as usize), rkc)),
             19 => (format!("{} {} {}", a, b, c), format!("R{} := {{}}", a)),
-            20 => (format!("{} {} {}{}", a, b, c, if kf != 0 { "k" } else { "" }), format!("R{} := R{}; R{} := R{}[{}]", a + 1, b, a, b, rkc)),
+            20 => {
+                let key = if v55 { k(c as usize) } else { rkc.clone() };
+                (format!("{} {} {}{}", a, b, c, if kf != 0 { "k" } else { "" }), format!("R{} := R{}; R{} := R{}[{}]", a + 1, b, a, b, key))
+            }
             21 | 32 => (format!("{} {} {}", a, b, sc), format!("R{} := R{} {} {}", a, b, arith_sym(op), sc)),
             33 => (format!("{} {} {}", a, b, sc), format!("R{} := {} << R{}", a, sc, b)),
             22..=31 => (format!("{} {} {}", a, b, c), format!("R{} := R{} {} {}", a, b, arith_sym(op), k(c as usize))),
@@ -106,12 +125,21 @@ pub fn disassemble_to(f: &Proto, name: Option<&str>, out: &mut dyn Write) {
             70 => (format!("{} {} {}", a, b, c), format!("return R{} ({} values)", a, if b == 0 { "...".to_string() } else { (b - 1).to_string() })),
             71 => (String::new(), "return".to_string()),
             72 => (format!("{}", a), format!("return R{}", a)),
+            73 if v55 => (format!("{} {}", a, bx), format!("update counters; if loop continues then R{} += step; goto {}", a + 2, jmp(-(bx as i64)))),
             73 => (format!("{} {}", a, bx), format!("R{} += R{}; if loop continues then R{} := R{}; goto {}", a, a + 2, a + 3, a, jmp(-(bx as i64)))),
             74 => (format!("{} {}", a, bx), format!("prepare R{}..R{}; if no iterations then goto {}", a, a + 3, jmp(bx as i64 + 1))),
             75 => (format!("{} {}", a, bx), format!("goto {}", jmp(bx as i64))),
+            76 if v55 => (format!("{} {}", a, c), format!("R{} to R{} := R{}(R{}, R{})", a + 3, a + 2 + c, a, a + 1, a + 3)),
             76 => (format!("{} {}", a, c), format!("R{} to R{} := R{}(R{}, R{})", a + 4, a + 3 + c, a, a + 1, a + 2)),
+            77 if v55 => (format!("{} {}", a, bx), format!("if R{} ~= nil then goto {}", a + 3, jmp(-(bx as i64)))),
             77 => (format!("{} {}", a, bx), format!("if R{} ~= nil then R{} := R{}; goto {}", a + 4, a + 2, a + 4, jmp(-(bx as i64)))),
-            78 => (format!("{} {} {}", a, b, c), format!("R{}[{} + i] := R{} + i, 1 <= i <= {}", a, c, a, if b == 0 { "top".to_string() } else { b.to_string() })),
+            78 => {
+                let (n, start) = if v55 { ((i >> 16) & 0x3F, (i >> 22) & 0x3FF) } else { (b, c) };
+                (format!("{} {} {}", a, n, start), format!("R{}[{} + i] := R{} + i, 1 <= i <= {}", a, start, a, if n == 0 { "top".to_string() } else { n.to_string() }))
+            }
+            200 => (format!("{} {} {}", a, b, c), format!("R{} := vararg R{}[R{}]", a, b, c)),
+            201 => (format!("{} {}", a, bx), format!("if R{} ~= nil then error \"global {} already defined\"", a,
+                if bx > 0 { k(bx as usize - 1) } else { "?".to_string() })),
             79 => (format!("{} {}", a, bx), match name {
                 Some(n) => format!("R{} := closure(Function #{}_{})", a, n, bx),
                 None => format!("R{} := closure(Function #{})", a, bx),
@@ -121,7 +149,11 @@ pub fn disassemble_to(f: &Proto, name: Option<&str>, out: &mut dyn Write) {
             82 => (format!("{}", ax), String::new()),
             _ => (format!("{:#010x}", i), "unknown opcode".to_string()),
         };
-        let opname = NAMES.get(op as usize).copied().unwrap_or("?");
+        let opname = match op {
+            200 => "GETVARG",
+            201 => "ERRNNIL",
+            _ => NAMES.get(op as usize).copied().unwrap_or("?"),
+        };
         let _ = writeln!(out, "{:5} [-]: {:<10} {:<13}; {}", pc, opname, args, note);
     }
     let _ = writeln!(out);

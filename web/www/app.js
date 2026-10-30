@@ -106,7 +106,7 @@ function describeHeader(bytes) {
   if (sig === "\x1bLua") {
     const v = bytes[4];
     const name = `Lua ${v >> 4}.${v & 0xf}`;
-    if (v < 0x51 || v > 0x54) return { ok: false, text: `${name} bytecode (only 5.1–5.4 are supported)` };
+    if (v < 0x51 || v > 0x55) return { ok: false, text: `${name} bytecode (only 5.1–5.5 are supported)` };
     return { ok: true, text: `${name} bytecode` };
   }
   if (sig.startsWith("\x1bLJ")) {

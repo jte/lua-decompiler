@@ -204,6 +204,8 @@ fn vars_in_stat(s: &Stat, out: &mut BTreeSet<VarId>) {
 }
 
 fn captured_in_stat(s: &Stat, out: &mut BTreeSet<VarId>) {
+    // A `<close>` variable is read-only: never reuse it for another value.
+    if let Some(v) = lua_ast::tbc_arg(s).and_then(var_id) { out.insert(v); }
     let mut look = |e: &Expr| {
         crate::simplify::lua_ast_walk(e, &mut |x| {
             if let Some(args) = pseudo_args(x, "@closure") {

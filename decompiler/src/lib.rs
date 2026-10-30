@@ -255,7 +255,9 @@ fn decompile_fn(
 ) -> FuncBody {
     let d = ir::decode(proto);
     let flow = Flow::build(&d);
-    let an = webs::analyze(&d, &flow, proto.numparams as u16);
+    // A 5.5 named vararg parameter (`...t`) is one more register parameter.
+    let named_vararg = ir::named_vararg(proto);
+    let an = webs::analyze(&d, &flow, proto.numparams as u16 + named_vararg as u16);
     let mut debug = names::debug_names(proto, &an);
     if method && !upnames.iter().any(|n| n == "self") {
         if let Some(&p0) = an.param_vars.first() {
@@ -380,9 +382,12 @@ fn decompile_fn(
     astpass::finalize(&mut body, true);
     astpass::rename_labels(&mut body);
 
+    let mut param_names: Vec<String> = params.iter().map(|v| names[v].clone()).collect();
+    let vararg_name = if named_vararg { param_names.pop() } else { None };
     FuncBody {
-        params: params.iter().map(|v| names[v].clone()).collect(),
+        params: param_names,
         has_vararg: proto.is_vararg != 0,
+        vararg_name,
         body,
     }
 }

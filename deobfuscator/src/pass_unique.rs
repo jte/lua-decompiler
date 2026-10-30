@@ -125,6 +125,7 @@ impl Renamer {
             Expr::Function(fb) => {
                 let mark = self.env.len();
                 for p in fb.params.iter_mut() { *p = self.declare(p); }
+                if let Some(v) = fb.vararg_name.as_mut() { *v = self.declare(v); }
                 self.block(&mut fb.body);
                 self.env.truncate(mark);
             }

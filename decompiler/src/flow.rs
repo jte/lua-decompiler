@@ -92,11 +92,14 @@ impl Flow {
         let mut genfor_at: BTreeMap<usize, (Reg, u16, usize, usize, u16)> = BTreeMap::new();
         for pc in 0..n {
             match &d.ins[pc] {
-                Ins::TForCall { a, nvars, base } => {
+                Ins::TForCall { a, nvars, base, ctl } => {
                     let q = d.next[pc];
                     if let Some(Ins::TForLoop { a: la, target, .. }) = d.ins.get(q) {
-                        if *la == a + 2 && *target < n {
-                            genfor_at.insert(pc, (*a, *nvars, *target, d.next[q], *base));
+                        if *la == a + ctl && *target < n {
+                            // 5.4+ explists fill four registers (the 4th is
+                            // the closing value).
+                            let setup = if *base == 3 && *ctl == 2 { 3 } else { 4 };
+                            genfor_at.insert(pc, (*a, *nvars, *target, d.next[q], setup));
                         }
                     }
                 }
@@ -230,7 +233,7 @@ impl Flow {
                         _ => nodes[id].term = Term::Exit,
                     }
                 }
-                Ins::ForLoop { a, target } => {
+                Ins::ForLoop { a, target, .. } => {
                     match (node_of(*target), node_of(d.next[last])) {
                         (Some(body), Some(exit)) => {
                             nodes[id].term = Term::NumFor { a: *a, pc: last };

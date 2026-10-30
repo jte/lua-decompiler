@@ -45,6 +45,23 @@ impl Printer {
                     continue;
                 }
             }
+            // 5.5 `global x = v` checks that x is not yet defined.
+            if let Stat::Call(Expr::Call { func, args }) = &block[i] {
+                if matches!(func.as_ref(), Expr::Name(n) if n == "@errnnil") && args.len() == 2 {
+                    let msg = match &args[1] {
+                        Expr::Str(s) => format!("global '{}' already defined", String::from_utf8_lossy(s)),
+                        _ => "global '?' already defined".to_string(),
+                    };
+                    let v = expr_with_prec(&args[0], BinOp::Ne.prec() + 1, false, self.indent);
+                    self.line(format!("if {} ~= nil then", v));
+                    self.indent += 1;
+                    self.line(format!("error({})", crate::lua_string_literal(msg.as_bytes())));
+                    self.indent -= 1;
+                    self.line("end");
+                    i += 1;
+                    continue;
+                }
+            }
             if let Some(t) = crate::tbc_arg(&block[i]) {
                 let v = self.expr(t);
                 self.line(format!("local _close <close> = {}", v));
@@ -311,7 +328,12 @@ fn table_needs_multiline(fields: &[TableField], indent: usize) -> bool {
 
 fn fmt_params_from(body: &FuncBody, skip: usize) -> String {
     let mut p: Vec<String> = body.params.iter().skip(skip).cloned().collect();
-    if body.has_vararg { p.push("...".to_string()); }
+    if body.has_vararg {
+        p.push(match &body.vararg_name {
+            Some(n) => format!("...{}", n),
+            None => "...".to_string(),
+        });
+    }
     p.join(", ")
 }
 
@@ -492,10 +514,11 @@ pub fn is_lua_ident(s: &str) -> bool {
         _ => return false,
     }
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') { return false; }
+    // `global` is reserved from Lua 5.5 on; `t["global"]` works everywhere.
     !matches!(s,
         "and"|"break"|"do"|"else"|"elseif"|"end"|"false"|"for"|"function"|
-        "goto"|"if"|"in"|"local"|"nil"|"not"|"or"|"repeat"|"return"|"then"|
-        "true"|"until"|"while"
+        "global"|"goto"|"if"|"in"|"local"|"nil"|"not"|"or"|"repeat"|"return"|
+        "then"|"true"|"until"|"while"
     )
 }
 
@@ -508,7 +531,7 @@ pub fn is_valid_lvalue(name: &str) -> bool {
     let tok = &name[..end];
     if matches!(tok,
         "nil"|"true"|"false"|"not"|"and"|"or"|"if"|"then"|"else"|"elseif"|"end"
-        |"do"|"while"|"repeat"|"until"|"for"|"in"|"local"|"function"|"return"|"break"|"goto"
+        |"do"|"while"|"repeat"|"until"|"for"|"in"|"local"|"function"|"return"|"break"|"goto"|"global"
     ) { return false; }
     matches!(name.as_bytes().get(end), None | Some(b'[') | Some(b'.'))
 }

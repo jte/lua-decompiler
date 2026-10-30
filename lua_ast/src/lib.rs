@@ -177,6 +177,8 @@ pub enum UnOp {
 pub struct FuncBody {
     pub params:     Vec<String>,
     pub has_vararg: bool,
+    /// Lua 5.5 named vararg parameter: `function f(a, ...t)`.
+    pub vararg_name: Option<String>,
     pub body:       Block,
 }
 

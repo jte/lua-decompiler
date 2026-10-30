@@ -159,13 +159,13 @@ fn uses_defs(
                 }
             }
             Ins::ForPrep { .. } => {}
-            Ins::ForLoop { a, .. } => df.push(a + 3),
-            Ins::TForCall { a, nvars, base } => {
-                if !canon_header { u.extend([*a, a + 1, a + 2]); }
+            Ins::ForLoop { var, .. } => df.push(*var),
+            Ins::TForCall { a, nvars, base, ctl } => {
+                if !canon_header { u.extend([*a, a + 1, a + ctl]); }
                 for r in a + base..a + base + nvars { df.push(r); }
             }
             Ins::TForLoop { src, .. } => { if !canon_header { u.push(*src); } }
-            Ins::Tbc { a } => u.push(*a),
+            Ins::Tbc { a } | Ins::ErrNNil { a, .. } => u.push(*a),
             Ins::TForLoop51 { a, nvars } => {
                 // Lowered form tests the R(a+3) it just defined; the lifter
                 // refers to that def directly.
