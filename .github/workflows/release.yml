@@ -1,0 +1,95 @@
+# Build the command-line tool for Windows and Linux and attach it to a GitHub
+# release.  Run it by hand: Actions → "Build release" → Run workflow.
+name: Build release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.4.0 (created from the selected branch if it does not exist yet)"
+        required: true
+      draft:
+        description: "Create the release as a draft (only when it is new)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+            exe: lua-decompiler.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+            exe: lua-decompiler
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo build --release --locked -p cli --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          dir="lua-decompiler-${{ inputs.tag }}-${{ matrix.name }}"
+          mkdir "$dir"
+          bin="target/${{ matrix.target }}/release/cli"
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          cp "$bin" "$dir/${{ matrix.exe }}"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dir/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$dir.zip" "./$dir/*" > /dev/null
+          else
+            tar czf "$dir.tar.gz" "$dir"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: lua-decompiler-${{ inputs.tag }}-${{ matrix.name }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            draft=""
+            if [ "${{ inputs.draft }}" = "true" ]; then draft="--draft"; fi
+            gh release create "$TAG" dist/* --target "${{ github.sha }}" --title "$TAG" --generate-notes $draft
+          fi
